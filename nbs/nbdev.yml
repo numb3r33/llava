@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "llava"
+  site-url: "https://numb3r33.github.io/llava"
+  description: ""
+  repo-branch: main
+  repo-url: "https://github.com/numb3r33/llava"
