@@ -1,0 +1,145 @@
+# Configuration for Adaptive Patching VIT project
+
+project_name: Adaptive_Patching_VIT_fastai
+version: 1.0
+
+# --- Paths ---
+paths:
+  # Base directory where datasets are stored
+  data_base: /path/to/your/datasets/  # TODO: Update this path
+  # Directory to save outputs like trained models, logs, predictions
+  output_dir: /path/to/your/outputs/ # TODO: Update this path
+
+  # Specific dataset paths (relative to data_base or absolute)
+  # Stage 1: Projector Pre-training Data (e.g., CC3M 595K subset)
+  stage1_data: llava_pretrain/llava_pretrain.jsonl # Example placeholder
+  stage1_images: llava_pretrain/images # Example placeholder
+
+  # Stage 2: Instruction Fine-tuning Data (e.g., LLaVA-Instruct-150K)
+  stage2_data: llava_instruct_150k/llava_v1_5_mix665k.jsonl # Example placeholder
+  stage2_images: / # Images might be spread across different original dataset folders (COCO, GQA etc.)
+
+  # Evaluation dataset paths (relative to data_base or absolute)
+  vqav2_test: vqav2/test2015 # Example placeholder
+  vqav2_test_annotations: vqav2/v2_mscoco_test2015_annotations.json # Example placeholder
+  textvqa_val: textvqa/TextVQA_0.5.1_val.json # Example placeholder
+  textvqa_images: textvqa/train_images # Example placeholder (val images are often subset of train)
+  # Add paths for DocVQA, ChartQA, Custom Eval Set etc. as needed
+
+  # Saved model weights paths (relative to output_dir or absolute)
+  stage1_projector_weights: stage1_projector.pth
+  stage2_model_weights: stage2_full_model # Will likely be a directory for PEFT adapters
+
+# --- Model Configuration ---
+model:
+  # Base LLM identifier from Hugging Face Hub
+  llm_name_or_path: lmsys/vicuna-7b-v1.5
+  # Base Vision Encoder identifier from Hugging Face Hub
+  vision_encoder_name_or_path: openai/clip-vit-large-patch14-336
+  # Layer index from vision encoder to extract features (LLaVA 1.5 uses -2)
+  vision_feature_layer: -2
+  # Image token placeholder used in text templates before replacement
+  image_token: "<image>"
+  # Special token index used internally to mark image feature insertion points
+  image_token_index_marker: -200 # Marker used in input_ids before embedding replacement
+
+  # Projector configuration
+  projector:
+    type: mlp_2x # Simple 2-layer MLP
+    # Input dim should match vision encoder output dim (e.g., 1024 for ViT-L)
+    input_dim: 1024
+    # Output dim should match LLM hidden dim (e.g., 4096 for Vicuna-7B)
+    output_dim: 4096
+
+  # PEFT (LoRA) configuration (for Stage 2)
+  peft:
+    use_lora: true
+    lora_r: 8 # LoRA rank
+    lora_alpha: 16 # LoRA alpha scaling
+    lora_dropout: 0.05
+    # Modules to apply LoRA to (check Vicuna architecture)
+    target_modules: ["q_proj", "v_proj"] # Common targets, might need adjustment
+    # You might need to add other PEFT parameters like bias, task_type etc.
+
+  # Adaptive Patcher configuration (initially off)
+  adaptive_patcher:
+    enabled: false
+    strategy: null # e.g., 'variable_resolution', 'text_guided_attention', 'predictor'
+    # Strategy-specific parameters go here
+    # e.g., for variable_resolution:
+    # resolutions: [[336, 672], [672, 336], [672, 672]]
+
+  # Memory optimization
+  use_activation_checkpointing: true # Enable gradient checkpointing for LLM
+
+# --- Data Handling ---
+data:
+  # Image preprocessing parameters
+  image_size: 336
+  image_aspect_ratio_padding: pad # Method for resizing/padding ('pad' is common)
+  # Use CLIP's processor for stats by default
+  image_mean: [0.48145466, 0.4578275, 0.40821073]
+  image_std: [0.26862954, 0.26130258, 0.27577711]
+
+  # Text processing parameters
+  tokenizer_padding_side: right
+  tokenizer_model_max_length: 2048 # Max sequence length for tokenizer
+
+  # Stage 1 data template
+  stage1_text_template: plain # Special template for projector pre-training
+
+  # Stage 2 data template (matches LLM fine-tuning)
+  stage2_text_template: v1 # Vicuna v1 chat template
+
+  # Dataloader parameters
+  batch_size_per_device_stage1: 8 # Adjust based on VRAM
+  batch_size_per_device_stage2: 4 # Adjust based on VRAM
+  num_workers: 4
+
+# --- Training Parameters ---
+training:
+  # General
+  seed: 42
+  num_epochs_stage1: 1
+  num_epochs_stage2: 3 # Example, adjust based on convergence
+  learning_rate_stage1: 0.0001 # For projector
+  learning_rate_stage2: 0.00002 # For LLM fine-tuning (LoRA)
+  weight_decay: 0.
+  optimizer: AdamW
+  scheduler: cosine # Learning rate scheduler type
+  warmup_ratio: 0.03 # Ratio of steps for linear warmup
+
+  # Optimization
+  gradient_accumulation_steps: 4 # Accumulate gradients over N steps
+  use_mixed_precision: true # Use float16/bfloat16 (if supported)
+
+  # Stage 1 Specifics
+  freeze_vision_encoder_stage1: true
+  freeze_llm_stage1: true
+
+  # Stage 2 Specifics
+  freeze_vision_encoder_stage2: true # Default LLaVA 1.5 keeps vision frozen
+
+  # Saving checkpoints
+  save_strategy: "epoch" # Or "steps"
+  save_total_limit: 1 # Keep only the last checkpoint
+
+# --- Evaluation Parameters ---
+evaluation:
+  eval_batch_size_per_device: 4
+  # Add specific benchmark evaluation settings if needed
+
+# --- Logging ---
+logging:
+  wandb:
+    enabled: true
+    project: adaptive_patching_vit # TODO: Update W&B project name
+    entity: your_wandb_entity # TODO: Update W&B entity (username or team)
+    log_model: false # Whether to log model checkpoints as W&B artifacts ("checkpoint" or false)
+    # Add run names/tags/notes templates if desired
+
+# --- Environment ---
+environment:
+  # Set to true if using DeepSpeed (lower priority for single GPU)
+  use_deepspeed: false
+  # Add DeepSpeed config path if used
