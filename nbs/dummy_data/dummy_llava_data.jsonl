@@ -1,0 +1,5 @@
+{"id": "sample1", "image": "img1.jpg", "conversations": [{"from": "human", "value": "<image>\nDescribe this."}, {"from": "gpt", "value": "It is red."}]}
+{"id": "sample2", "image": "img2.png", "conversations": [{"from": "human", "value": "<image>\nWhat color?"}, {"from": "gpt", "value": "Green."}]}
+{"id": "sample3_missing_keys", "conversations": []}
+{"id": "sample4_bad_conv", "image": "img1.jpg", "conversations": "not a list"}
+{"id": "sample5_missing_img_file", "image": "nonexistent.jpg", "conversations": [{"from": "human", "value": "<image>"}, {"from": "gpt", "value": "..."}]}

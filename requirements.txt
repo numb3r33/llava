@@ -1,0 +1,13 @@
+fastai
+
+# Hugging Face Ecosystem
+transformers
+datasets
+huggingface-hub
+accelerate
+peft
+sentencepiece   # Often required by Hugging Face tokenizers
+
+# Project Management & Experiment Tracking
+nbdev
+wandb

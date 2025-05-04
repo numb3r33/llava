@@ -1,14 +1,14 @@
 # Configuration for Adaptive Patching VIT project
 
-project_name: Adaptive_Patching_VIT_fastai
+project_name: llava
 version: 1.0
 
 # --- Paths ---
 paths:
   # Base directory where datasets are stored
-  data_base: /path/to/your/datasets/  # TODO: Update this path
+  data_base: /workspace/llava/data/  # TODO: Update this path
   # Directory to save outputs like trained models, logs, predictions
-  output_dir: /path/to/your/outputs/ # TODO: Update this path
+  output_dir: /workspace/llava/output/ # TODO: Update this path
 
   # Specific dataset paths (relative to data_base or absolute)
   # Stage 1: Projector Pre-training Data (e.g., CC3M 595K subset)
