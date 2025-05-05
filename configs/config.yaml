@@ -12,24 +12,35 @@ paths:
 
   # Specific dataset paths (relative to data_base or absolute)
   # Stage 1: Projector Pre-training Data (e.g., CC3M 595K subset)
-  stage1_data: llava_pretrain/llava_pretrain.jsonl # Example placeholder
-  stage1_images: llava_pretrain/images # Example placeholder
+  stage1_data: llava_pretrain/llava_pretrain.jsonl # Example JSON Lines file for metadata
+  stage1_images: llava_pretrain/images # Example directory for images
 
   # Stage 2: Instruction Fine-tuning Data (e.g., LLaVA-Instruct-150K)
-  stage2_data: llava_instruct_150k/llava_v1_5_mix665k.jsonl # Example placeholder
-  stage2_images: . # Base dir for images referenced in stage 2 data (relative to data_base)
+  stage2_data: llava_instruct_150k/llava_v1_5_mix665k.jsonl # Example JSON Lines file
+  stage2_images: . # Base dir for images referenced in stage 2 data (can be multiple sources, resolved via path in JSONL)
 
   # Evaluation dataset paths (relative to data_base or absolute)
-  vqav2_test: vqav2/test2015 # Example placeholder
-  vqav2_test_annotations: vqav2/v2_mscoco_test2015_annotations.json # Example placeholder
-  textvqa_val: textvqa/TextVQA_0.5.1_val.json # Example placeholder
-  textvqa_images: textvqa/train_images # Example placeholder (val images are often subset of train)
-  # Add paths for DocVQA, ChartQA, Custom Eval Set etc. as needed
+  # Keys should match dataset_name used in evaluation scripts
+  vqav2_test:
+    annotations: vqav2/v2_mscoco_test2015_annotations.json # Placeholder VQAv2 test annotations
+    images: vqav2/test2015 # Placeholder VQAv2 test images path
+  textvqa_val:
+    annotations: textvqa/TextVQA_0.5.1_val.json # Placeholder TextVQA val annotations
+    images: textvqa/train_images # Placeholder TextVQA val images path (often same as train)
+  # docvqa_val:
+  #   annotations: docvqa/val_v1.0.json
+  #   images: docvqa/val_images
+  # chartqa_test:
+  #   annotations: chartqa/test_human.json
+  #   images: chartqa/test/png
+  # custom_eval:
+  #   annotations: custom_eval/annotations.jsonl
+  #   images: custom_eval/images
 
   # Saved model weights paths (relative to output_dir/models or absolute)
   # stage1_projector_weights defines the *input* weights for stage 2
   stage1_projector_weights: stage1_projector.pth # Filename for stage 1 projector weights
-  # stage2_model_weights defines the *output* filename for the stage 2 learner state
+  # stage2_model_weights defines the *output* filename for the stage 2 learner state or base name for adapters
   stage2_model_weights: stage2_llava_lora # Base name for saved stage 2 model/adapters
 
 # --- Model Configuration ---
@@ -131,8 +142,11 @@ training:
 
 # --- Evaluation Parameters ---
 evaluation:
-  eval_batch_size_per_device: 4
+  eval_batch_size_per_device: 4 # Batch size for evaluation runs
   # Add specific benchmark evaluation settings if needed
+  # generation_max_length: 200 # Max tokens for generate_predictions
+  # generation_temperature: 0.2
+  # generation_top_p: null
 
 # --- Logging ---
 logging:
