@@ -17,7 +17,7 @@ paths:
 
   # Stage 2: Instruction Fine-tuning Data (e.g., LLaVA-Instruct-150K)
   stage2_data: llava_instruct_150k/llava_v1_5_mix665k.jsonl # Example placeholder
-  stage2_images: / # Images might be spread across different original dataset folders (COCO, GQA etc.)
+  stage2_images: . # Base dir for images referenced in stage 2 data (relative to data_base)
 
   # Evaluation dataset paths (relative to data_base or absolute)
   vqav2_test: vqav2/test2015 # Example placeholder
@@ -26,9 +26,11 @@ paths:
   textvqa_images: textvqa/train_images # Example placeholder (val images are often subset of train)
   # Add paths for DocVQA, ChartQA, Custom Eval Set etc. as needed
 
-  # Saved model weights paths (relative to output_dir or absolute)
-  stage1_projector_weights: stage1_projector.pth
-  stage2_model_weights: stage2_full_model # Will likely be a directory for PEFT adapters
+  # Saved model weights paths (relative to output_dir/models or absolute)
+  # stage1_projector_weights defines the *input* weights for stage 2
+  stage1_projector_weights: stage1_projector.pth # Filename for stage 1 projector weights
+  # stage2_model_weights defines the *output* filename for the stage 2 learner state
+  stage2_model_weights: stage2_llava_lora # Base name for saved stage 2 model/adapters
 
 # --- Model Configuration ---
 model:
@@ -72,7 +74,7 @@ model:
     # e.g., for variable_resolution:
     # resolutions: [[336, 672], [672, 336], [672, 672]]
 
-  # Memory optimization
+  # Memory optimization - Step 4.4
   use_activation_checkpointing: false # Enable gradient checkpointing for LLM (Default to False, enable if needed)
 
 # --- Data Handling ---
@@ -104,9 +106,9 @@ training:
   # General
   seed: 42
   num_epochs_stage1: 1
-  num_epochs_stage2: 3 # Example, adjust based on convergence
-  learning_rate_stage1: 0.0001 # For projector
-  learning_rate_stage2: 0.00002 # For LLM fine-tuning (LoRA)
+  num_epochs_stage2: 3      # Number of epochs for Stage 2 fine-tuning
+  learning_rate_stage1: 1e-4 # For projector in Stage 1
+  learning_rate_stage2: 2e-5 # For projector & LoRA adapters in Stage 2 (typically lower)
   weight_decay: 0.
   optimizer: AdamW
   scheduler: cosine # Learning rate scheduler type
