@@ -12,7 +12,7 @@ import json
 import torch
 import time
 from tqdm.auto import tqdm
-from typing import Union, Optional # Added Union
+from typing import Union, Optional, Dict, Any, List # Added Dict, Any, List
 import wandb # Added wandb import
 import argparse # Added argparse for script execution
 
@@ -73,6 +73,7 @@ def generate_predictions(learner: Learner,
                          top_p: Optional[float] = None, # Nucleus sampling top_p
                         ):
     """Generates predictions for a test dataloader and saves them to a JSON Lines file.
+    Includes efficiency logging (latency, peak VRAM).
 
     Uses the HF generate method on the underlying language model component,
     manually preparing the combined image and text embeddings.
@@ -117,58 +118,81 @@ def generate_predictions(learner: Learner,
     print(f"Generating predictions for {len(test_dl.dataset)} samples...")
     print(f"Saving predictions to: {output_file}")
     
+    # Reset CUDA memory stats before generation loop for accurate peak measurement
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device=device) 
+        print("Reset CUDA peak memory stats before generation.")
+
     # Use context manager for file writing
     with torch.no_grad(), open(output_file, 'w') as f_out:
         # Iterate through batches
         for batch in tqdm(test_dl, desc="Generating Predictions"):
+            start_time = time.time() # Start timing for this batch
+            
             # Move batch items to appropriate device
-            # Assume batch transform applied by DataLoader if needed, or apply manually
-            # Here we assume the batch is a dict from LLaVABatchTransform
             if not isinstance(batch, dict):
                  print(f"Warning: Expected batch to be a dict, got {type(batch)}. Attempting to proceed assuming basic structure.")
-                 # Minimal assumption: batch is a tuple (images, texts) - this might fail
                  pixel_values = batch[0].to(device)
-                 input_ids = batch[1].to(device) # This might need more complex handling
+                 input_ids = batch[1].to(device)
                  batch_size = pixel_values.shape[0]
+                 # Need a way to get IDs if batch isn't dict
+                 batch_ids = [f"unknown_{num_samples+i}" for i in range(batch_size)]
             else:
                 pixel_values = batch['pixel_values'].to(device)
-                input_ids = batch['input_ids'].to(device) # Contains prompt + -200 marker
+                input_ids = batch['input_ids'].to(device) 
                 batch_size = pixel_values.shape[0]
+                # Assuming the dataloader added the original sample ID to the batch dict
+                # This depends on modifying the DataBlock/Dataset/Collate
+                # For now, let's try getting it from the dataloader's dataset if possible
+                batch_ids = []
+                start_ds_idx = test_dl.num_workers * test_dl.offs if hasattr(test_dl, 'offs') else num_samples
+                for i in range(batch_size):
+                    current_item_idx = start_ds_idx + i
+                    item_id = f"sample_{current_item_idx}" # Default ID
+                    try:
+                        if hasattr(test_dl, 'dataset') and current_item_idx < len(test_dl.dataset):
+                            item_data = test_dl.dataset[current_item_idx]
+                            # Adapt based on what dataset[idx] returns
+                            if hasattr(item_data, 'sample_id'): # If LLaVASample
+                                item_id = item_data.sample_id
+                            elif isinstance(item_data, dict) and 'id' in item_data: # If dict from JSONL
+                                item_id = item_data['id']
+                            # Add other checks if dataset format is different
+                    except Exception:
+                        pass # Use default ID
+                    batch_ids.append(item_id)
 
-            start_time = time.time()
-            
             # --- Generation using underlying HF LLM --- 
             # 1. Encode images and project features
             image_features = model.encode_image(pixel_values) # (B, P, D_clip)
             if image_features is None: 
                 print("Warning: Image encoding failed for batch. Skipping.")
+                num_samples += batch_size # Account for skipped samples in latency calculation
+                total_time += (time.time() - start_time) # Add time spent
                 continue # Skip this batch
             projected_features = model.projector(image_features) # (B, P, D_llm)
             
             outputs_list = []
             # Process each sample in the batch individually for embedding preparation
             for i in range(batch_size):
-                current_input_ids = input_ids[i:i+1] # Keep batch dim [1, S]
-                current_proj_features = projected_features[i:i+1] # Keep batch dim [1, P, D]
+                current_input_ids = input_ids[i:i+1] 
+                current_proj_features = projected_features[i:i+1]
                 
-                # Find the placeholder marker (-200)
-                # Use the marker defined in the model's config or the global default
                 marker = getattr(model, 'image_token_index_marker', IMAGE_TOKEN_INDEX_PLACEHOLDER)
                 image_token_indices = torch.where(current_input_ids[0] == marker)[0]
                 
                 if len(image_token_indices) == 0:
                     print(f"Warning: Image token marker {marker} not found in sample {num_samples + i}. Skipping generation.")
-                    outputs_list.append(torch.tensor([tok.eos_token_id], device=device)) # Append EOS as fallback
+                    outputs_list.append(torch.tensor([tok.eos_token_id], device=device)) 
                     continue
                 
                 image_token_start_index = image_token_indices[0].item()
 
-                # 2. Prepare prompt embeddings
+                # Prepare prompt embeddings
                 input_ids_no_marker = current_input_ids.clone()
-                input_ids_no_marker[input_ids_no_marker == marker] = 0 # Replace marker for embedding lookup
+                input_ids_no_marker[input_ids_no_marker == marker] = 0 
                 text_embeddings = model.get_input_embeddings()(input_ids_no_marker)
                 
-                # Slice and concatenate embeddings
                 text_emb_before = text_embeddings[:, :image_token_start_index]
                 text_emb_after = text_embeddings[:, image_token_start_index + 1:]
                 
@@ -178,17 +202,14 @@ def generate_predictions(learner: Learner,
                     text_emb_after
                 ], dim=1)
                 
-                # 3. Generate using the underlying LLM
-                # Handle PEFT model structure to get the base model for generation
+                # Generate using the underlying LLM
                 llm_component = model.language_model
                 if _peft_available and isinstance(llm_component, PeftModel):
-                     llm_component = llm_component.base_model.model # Get the underlying HF model
+                     llm_component = llm_component.base_model.model 
                 
-                # Create attention mask for the prompt embeddings
                 prompt_attention_mask = torch.ones(prompt_embeds.shape[:2], dtype=torch.long, device=device)
                 
                 try:
-                    # Generation parameters
                     gen_params = {
                         "inputs_embeds": prompt_embeds,
                         "attention_mask": prompt_attention_mask,
@@ -202,50 +223,32 @@ def generate_predictions(learner: Learner,
                         gen_params["temperature"] = temperature
                         if top_p is not None:
                             gen_params["top_p"] = top_p
-                    else: # Greedy decoding
-                        gen_params["temperature"] = 1.0 # Temp=0 not allowed, use 1.0 for greedy essentially
+                    else: 
+                        gen_params["temperature"] = 1.0 
                         gen_params["do_sample"] = False
 
                     output_ids_gen = llm_component.generate(**gen_params)
                     
-                    # Remove prompt tokens from the generated output
                     output_ids_gen = output_ids_gen[:, prompt_embeds.shape[1]:]
-                    outputs_list.append(output_ids_gen[0]) # Get the single sequence
+                    outputs_list.append(output_ids_gen[0]) 
                 except Exception as gen_e:
                      print(f"Error during generation for sample {num_samples + i}: {gen_e}")
                      outputs_list.append(torch.tensor([tok.eos_token_id], device=device)) # Fallback
             # --- End Generation for Batch --- #
 
-            end_time = time.time()
+            end_time = time.time() # End timing for this batch
             total_time += (end_time - start_time)
             num_samples_in_batch = batch_size
 
             # --- Decode and Save Results for the Batch --- 
-            # Get item IDs (requires dataset structure knowledge)
-            start_idx = num_samples # Index before this batch
-            item_ids = []
-            for i in range(num_samples_in_batch):
-                 current_item_idx = start_idx + i
-                 # Check if test_dl.items exists and is indexable
-                 # Note: test_dl.items might be a generator or complex object.
-                 # A more robust way might be needed if test_dl.items isn't a simple list.
-                 item_id_found = False
-                 if hasattr(test_dl, 'items') and isinstance(test_dl.items, (list, tuple)) and current_item_idx < len(test_dl.items):
-                     item = test_dl.items[current_item_idx]
-                     # Check if item is LLaVASample or similar object with sample_id
-                     if hasattr(item, 'sample_id'):
-                         item_id = getattr(item, 'sample_id')
-                         item_id_found = True
-                 if not item_id_found:
-                     item_id = f"sample_{current_item_idx}" # Fallback ID
-                 item_ids.append(item_id)
+            # Use the batch_ids retrieved earlier
+            item_ids = batch_ids
                  
             # Decode and write each result in the batch
             for i, gen_ids in enumerate(outputs_list):
-                # Ensure gen_ids is on CPU for decoding
                 decoded_text = tok.decode(gen_ids.cpu(), skip_special_tokens=True).strip()
                 result_entry = {
-                    "id": item_ids[i], 
+                    "id": item_ids[i], # Use the ID retrieved from the dataset/batch
                     "prediction": decoded_text,
                 }
                 f_out.write(json.dumps(result_entry) + '\\n')
@@ -253,81 +256,122 @@ def generate_predictions(learner: Learner,
             
             num_samples += num_samples_in_batch # Update total sample count
 
+    # --- Log Efficiency Metrics (Step 5.4) --- 
     avg_latency = (total_time / num_samples) * 1000 if num_samples > 0 else 0
     print(f"Finished generation. Saved {len(results)} predictions to {output_file}")
     print(f"Average inference latency: {avg_latency:.2f} ms/sample")
     
-    # Log latency to W&B if active (Step 5.4)
     if wandb.run is not None:
         wandb.log({"eval/avg_inference_latency_ms": avg_latency})
 
-    # Measure peak inference VRAM (Step 5.4)
     if torch.cuda.is_available():
-        peak_vram = torch.cuda.max_memory_allocated() / (1024**3) # Convert bytes to GB
-        print(f"Peak Inference VRAM used: {peak_vram:.2f} GB")
+        peak_vram_gb = torch.cuda.max_memory_allocated(device=device) / (1024**3) 
+        print(f"Peak Inference VRAM used: {peak_vram_gb:.2f} GB")
         if wandb.run is not None:
-            wandb.log({"eval/peak_inference_vram_gb": peak_vram})
-        torch.cuda.reset_peak_memory_stats() # Reset for next measurement
+            wandb.log({"eval/peak_inference_vram_gb": peak_vram_gb})
+        # Reset peak stats after logging for this run
+        torch.cuda.reset_peak_memory_stats(device=device) 
         
     return results # Return list of predictions
 
 # %% ../nbs/40_evaluation.ipynb 5
-def evaluate_vqa(preds_file: Union[str, Path], gt_file: Union[str, Path], **kwargs):
-    """Placeholder function to evaluate VQAv2 predictions.
+def evaluate_vqa(preds_file: Union[str, Path], 
+                 gt_file: Union[str, Path], 
+                 ques_file: Optional[Union[str, Path]] = None, # Path to questions file if needed by API
+                 **kwargs):
+    """Evaluates VQAv2 predictions using the official VQA evaluation tools.
     
     Args:
-        preds_file: Path to the JSON prediction file (expected format: [{'question_id': id, 'answer': prediction}]).
-        gt_file: Path to the ground truth annotation file (e.g., VQA v2 format).
-        **kwargs: Additional arguments for the VQA eval API (e.g., version).
+        preds_file: Path to the JSON Lines prediction file generated by `generate_predictions`
+                    (expected format: {'id': question_id, 'prediction': answer}).
+        gt_file: Path to the ground truth annotation file (e.g., v2_mscoco_val2014_annotations.json).
+        ques_file: Path to the questions file (e.g., v2_OpenEnded_mscoco_val2014_questions.json). 
+                   Required by the standard VQA eval tools.
+        **kwargs: Additional arguments (unused currently).
     
     Returns:
-        Dictionary containing VQA scores (e.g., {'overall': score}).
+        Dictionary containing VQA scores (e.g., {'overall': score, 'yes/no': ..., 'number': ..., 'other': ...}), 
+        or {'overall': 0.0} if evaluation fails.
     """
-    print(f"--- VQA Evaluation (Placeholder) ---")
+    print(f"--- VQA Evaluation --- ")
     print(f"Predictions file: {preds_file}")
-    print(f"Ground Truth file: {gt_file}")
+    print(f"Ground Truth Annotation file: {gt_file}")
+    print(f"Ground Truth Questions file: {ques_file}")
+    results = {"overall": 0.0} # Default return value
     
-    # --- TODO: Implement actual VQA evaluation logic (Step 5.5) --- 
-    # 1. Ensure predictions file is in the correct format for the official VQA eval tool.
-    # 2. Import or call the official VQA evaluation script/library.
-    #    (Requires downloading the VQA evaluation tools: https://visualqa.org/evaluation.html)
-    # Example structure:
-    # try:
-    #     from vqa_eval_tools.vqa import VQA
-    #     from vqa_eval_tools.vqaEval import VQAEval
-    #     
-    #     vqa_ann = VQA(gt_file, None) # Load annotations
-    #     vqa_pred = vqa_ann.loadRes(preds_file, gt_file) # Load predictions
-    #     
-    #     vqa_eval = VQAEval(vqa_ann, vqa_pred, n=2) # n=2 is standard for VQA
-    #     vqa_eval.evaluate()
-    #     
-    #     results = {
-    #         "overall": vqa_eval.accuracy['overall'],
-    #         "yes/no": vqa_eval.accuracy['perAnswerType']['yes/no'],
-    #         "number": vqa_eval.accuracy['perAnswerType']['number'],
-    #         "other": vqa_eval.accuracy['perAnswerType']['other'],
-    #     }
-    #     print(f"Calculated VQA Accuracy: {results}")
-    # except ImportError:
-    #     print("Error: VQA evaluation tools not found. Please install them.")
-    #     results = {"overall": 0.0} # Return dummy score
-    # except Exception as e:
-    #     print(f"Error during VQA evaluation: {e}")
-    #     results = {"overall": 0.0} # Return dummy score
-    # -------------------------------------------------------------
-    
-    print("Actual VQA evaluation logic not yet implemented.")
-    dummy_score = 0.5 # Placeholder score
-    results = {"overall": dummy_score} # Placeholder result
+    if ques_file is None:
+        print("Error: Path to questions file (ques_file) is required for VQA evaluation.")
+        return results
+
+    try:
+        # --- Load VQA Tools --- 
+        # Assumes the VQA evaluation tools directory ('PythonHelperTools') is in the Python path.
+        # User needs to download from https://visualqa.org/download.html
+        # and add the PythonHelperTools directory to their PYTHONPATH or sys.path
+        try:
+            from vqaTools.vqa import VQA
+            from vqaEvaluation.vqaEval import VQAEval
+        except ImportError:
+            print("Error: VQA evaluation tools (vqaTools/vqaEvaluation) not found in PYTHONPATH.")
+            print("Please download from https://visualqa.org/download.html and add PythonHelperTools to your path.")
+            return results
+        
+        # --- Load and Reformat Predictions --- 
+        vqa_preds_formatted = []
+        print(f"Loading and reformatting predictions from {preds_file}...")
+        with open(preds_file, 'r') as f_pred:
+            for line in f_pred:
+                try:
+                    pred_item = json.loads(line.strip())
+                    # VQA API expects integer question_id
+                    question_id = int(pred_item['id']) 
+                    answer = pred_item['prediction']
+                    vqa_preds_formatted.append({
+                        'question_id': question_id,
+                        'answer': answer
+                    })
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    print(f"Warning: Skipping invalid prediction line: {line.strip()}. Error: {e}")
+        print(f"Loaded {len(vqa_preds_formatted)} predictions for evaluation.")
+        if not vqa_preds_formatted:
+            print("Error: No valid predictions found in the file.")
+            return results
+        
+        # --- Run VQA Evaluation --- 
+        print("Initializing VQA evaluation...")
+        vqa_ann = VQA(gt_file, ques_file) # Load annotations and questions
+        vqa_pred = vqa_ann.loadRes(vqa_preds_formatted, ques_file) # Load predictions
+        
+        vqa_eval = VQAEval(vqa_ann, vqa_pred, n=2) # n=2 is standard for VQA
+        
+        print("Running evaluation...")
+        vqa_eval.evaluate() # Perform evaluation
+        
+        print("Evaluation complete. Results:")
+        vqa_eval.showEvals() # Print detailed results
+        
+        # Extract results into a dictionary
+        results = {
+            "overall": vqa_eval.accuracy['overall'],
+            "yes/no": vqa_eval.accuracy['perAnswerType']['yes/no'],
+            "number": vqa_eval.accuracy['perAnswerType']['number'],
+            "other": vqa_eval.accuracy['perAnswerType']['other'],
+        }
+        print(f"Parsed VQA Accuracy: {results}")
+
+    except FileNotFoundError as e:
+         print(f"Error: Required file not found: {e}")
+    except Exception as e:
+        print(f"Error during VQA evaluation: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Log metric to W&B if active
     if wandb.run is not None:
         wandb.log({"eval/vqa_score_overall": results.get("overall", 0.0)})
-        # Log other scores if needed
-        # wandb.log({"eval/vqa_score_yes_no": results.get("yes/no", 0.0)})
-        # wandb.log({"eval/vqa_score_number": results.get("number", 0.0)})
-        # wandb.log({"eval/vqa_score_other": results.get("other", 0.0)})
+        wandb.log({"eval/vqa_score_yes_no": results.get("yes/no", 0.0)})
+        wandb.log({"eval/vqa_score_number": results.get("number", 0.0)})
+        wandb.log({"eval/vqa_score_other": results.get("other", 0.0)})
         
     return results
 
@@ -362,13 +406,13 @@ def evaluate_textvqa(preds_file: Union[str, Path], gt_file: Union[str, Path], **
     #     
     #     # Preprocess/align predictions and ground truth based on IDs
     #     gt_dict = {item['questionId']: item['answers'] for item in ground_truth['data']}
-    #     pred_dict = {item['question_id']: item['prediction'] for item in predictions}
+    #     pred_dict = {item['id']: item['prediction'] for item in predictions} # Match ID key
     #     
     #     total_anls = 0
     #     count = 0
     #     for qid, prediction in pred_dict.items():
-    #         if qid in gt_dict:
-    #             gt_answers = gt_dict[qid]
+    #         if str(qid) in gt_dict: # Ensure ID matching (might need type conversion)
+    #             gt_answers = gt_dict[str(qid)]
     #             # Calculate ANLS for this sample (max over multiple GT answers)
     #             sample_anls = calculate_single_anls(prediction, gt_answers)
     #             total_anls += sample_anls
@@ -431,9 +475,8 @@ def run_evaluation(config_path: Union[str, Path],
     learner = None
     run = None # Initialize wandb run object
     try:
-        # --- Initialize W&B ---
+        # --- Initialize W&B --- 
         if config.get('logging', {}).get('wandb', {}).get('enabled', False):
-             # Create a unique run name for evaluation
              model_id_for_run = Path(model_checkpoint_path or config['paths']['stage2_model_weights']).stem
              run_name = f"eval_{model_id_for_run}_{dataset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
              run = init_wandb(config, job_type="evaluation", run_name=run_name)
@@ -444,16 +487,13 @@ def run_evaluation(config_path: Union[str, Path],
             model_load_base = models_dir / model_base_name
             print(f"Using model base name from config: {model_base_name}")
         else:
-            # If a specific path is given, use its stem as the base name
             model_checkpoint_path = Path(model_checkpoint_path)
             model_base_name = model_checkpoint_path.stem 
-            # Assume the path points to the base (e.g., stage2_llava_lora), not the specific file
             model_load_base = model_checkpoint_path 
             print(f"Using provided model base path: {model_load_base}")
         
         # 2. Load Model Components Manually
         print("Loading model components for evaluation...")
-        # Pass the config to the model constructor
         model = BaselineLLaVAModel(config=config) 
         
         # Load projector weights
@@ -467,17 +507,11 @@ def run_evaluation(config_path: Union[str, Path],
         # Load LoRA adapters or full LLM weights
         use_lora_config = config.get('model', {}).get('peft', {}).get('use_lora', False)
         lora_adapter_path = model_load_base.parent / (model_load_base.name + "_lora_adapters")
-        # full_model_path = model_load_base.parent / (model_load_base.name + ".pth") # Example for full save
 
         if use_lora_config:
             if lora_adapter_path.exists() and _peft_available and isinstance(model.language_model, PeftModel):
                 print(f"Loading LoRA adapters from {lora_adapter_path}")
-                # Ensure the adapter is loaded correctly. `load_adapter` might add a new one.
-                # If `get_peft_model` was called during init, we might need to ensure the base model is loaded correctly first.
-                # Safest is often to load the base model, then apply PEFT wrapper, then load adapters.
-                # Assuming BaselineLLaVAModel's init already called get_peft_model:
                 try:
-                    # Ensure the PeftModel is ready
                     if hasattr(model.language_model, 'load_adapter'):
                          model.language_model.load_adapter(str(lora_adapter_path), adapter_name="default")
                          print("LoRA adapters loaded successfully.")
@@ -490,23 +524,15 @@ def run_evaluation(config_path: Union[str, Path],
         else:
              print("LoRA not used. Assuming full LLM fine-tuning.")
              print("Warning: Loading full fine-tuned LLM state is not fully implemented here yet. Model may use base weights.")
-             # TODO: Implement loading full model state if needed (e.g., from SaveModelCallback output)
-             # if full_model_path.exists():
-             #    learner_state = torch.load(full_model_path, map_location='cpu')
-             #    model.load_state_dict(learner_state['model'])
-             #    print(f"Loaded full model state from {full_model_path}")
              
         # 3. Create Learner Shell for Convenience
-        # Use a dummy dataloader just to hold the device context etc.
-        dummy_dl = DataLoader(list(range(1)), bs=1) # Minimal dataloader
+        dummy_dl = DataLoader(list(range(1)), bs=1)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
-        # Create a dummy DataLoaders object to satisfy Learner init
         dummy_dls = DataLoaders(dummy_dl, dummy_dl) 
-        dummy_dls.device = device # Set device on DataLoaders
-        learner = Learner(dls=dummy_dls, model=model, loss_func=lambda x,y: 0) # Dummy loss
+        dummy_dls.device = device 
+        learner = Learner(dls=dummy_dls, model=model, loss_func=lambda x,y: 0)
         
-        # Manually assign tokenizer if generate_predictions needs it from learner
         global tokenizer 
         if tokenizer is None:
              raise RuntimeError("Tokenizer not loaded, cannot proceed with evaluation.")
@@ -515,8 +541,6 @@ def run_evaluation(config_path: Union[str, Path],
         
         # 4. Load Test Data
         print(f"Loading test data for {dataset_name}...")
-        # Need to instantiate the correct DataBlock (e.g., Stage 2 for VQA/TextVQA)
-        # Assuming Stage 2 structure is suitable for standard eval datasets
         if LLaVADataBlockStage2 is None:
              raise RuntimeError("LLaVADataBlockStage2 is not defined. Cannot load test data.")
         test_dl = get_test_dataloader(config, dataset_name, dblock=LLaVADataBlockStage2)
@@ -525,43 +549,46 @@ def run_evaluation(config_path: Union[str, Path],
 
         # 5. Generate Predictions
         if output_filename is None:
-            # Use the resolved model base name for the output file
             output_filename = f"preds_{model_base_name}_{dataset_name}.jsonl"
         preds_file = eval_output_dir / output_filename
         
-        # Get generation kwargs from **kwargs
         gen_kwargs = {k: v for k, v in kwargs.items() if k in ['max_len', 'temperature', 'top_p']}
         
         generate_predictions(learner, test_dl, preds_file, **gen_kwargs)
 
-        # 6. Run Evaluation Scripts
+        # 6. Run Evaluation Metrics
         print("Running evaluation metrics...")
-        # Determine Ground Truth file path based on dataset_name
         gt_config = config['paths'].get(dataset_name)
         if not gt_config or 'annotations' not in gt_config:
             print(f"Warning: Ground truth annotation path not found for '{dataset_name}' in config. Cannot run metrics.")
         else:
             gt_file_path = Path(config['paths']['data_base']) / gt_config['annotations']
+            # Check for the questions file path, especially for VQA
+            ques_file_path = None
+            if 'questions' in gt_config:
+                 ques_file_path = Path(config['paths']['data_base']) / gt_config['questions']
+            elif 'vqav2' in dataset_name.lower(): # Infer default VQA questions file path if not specified
+                 ann_path_parts = list(gt_file_path.parts)
+                 if 'annotations' in ann_path_parts[-1]:
+                      ques_filename = gt_file_path.name.replace('annotations', 'questions').replace('v2_mscoco', 'v2_OpenEnded_mscoco')
+                      ques_file_path_default = gt_file_path.parent / ques_filename
+                      if ques_file_path_default.exists():
+                           ques_file_path = ques_file_path_default
+                           print(f"Inferred VQA questions file path: {ques_file_path}")
+            
             if not gt_file_path.exists():
                  print(f"Warning: Ground truth file not found at {gt_file_path}. Cannot run metrics.")
             else:
-                 # Call appropriate evaluation function based on dataset name convention
                  if 'vqav2' in dataset_name.lower():
-                     vqa_results = evaluate_vqa(preds_file, gt_file_path)
-                     print(f"VQAv2 Results: {vqa_results}")
+                     if ques_file_path and ques_file_path.exists():
+                         vqa_results = evaluate_vqa(preds_file, gt_file_path, ques_file=ques_file_path)
+                         print(f"VQAv2 Results: {vqa_results}")
+                     else:
+                          print(f"Warning: VQA questions file not found or specified ({ques_file_path}). Cannot run VQA evaluation.")
                  elif 'textvqa' in dataset_name.lower():
                      anls_results = evaluate_textvqa(preds_file, gt_file_path)
                      print(f"TextVQA ANLS Results: {anls_results}")
                  # --- Add more evaluation cases here --- #
-                 # elif 'docvqa' in dataset_name.lower():
-                 #     docvqa_results = evaluate_textvqa(preds_file, gt_file_path) # Often uses ANLS too
-                 #     print(f"DocVQA ANLS Results: {docvqa_results}")
-                 # elif 'chartqa' in dataset_name.lower():
-                 #     # chartqa_results = evaluate_chartqa(preds_file, gt_file_path)
-                 #     print("ChartQA evaluation not implemented yet.")
-                 # elif 'custom_eval' in dataset_name.lower():
-                 #     # custom_results = evaluate_custom(preds_file, gt_file_path)
-                 #     print("Custom eval set evaluation not implemented yet.")
                  else:
                      print(f"No specific evaluation script configured for dataset: {dataset_name}")
 
@@ -569,6 +596,7 @@ def run_evaluation(config_path: Union[str, Path],
         print(f"An error occurred during evaluation: {e}")
         import traceback
         traceback.print_exc()
+        if run: run.finish(exit_code=1)
     finally:
         # Clean up memory
         if learner is not None and hasattr(learner, 'model') and learner.model is not None:
@@ -578,13 +606,12 @@ def run_evaluation(config_path: Union[str, Path],
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print("Cleaned up model memory.")
-        # Finish W&B run if active 
-        if run is not None: 
+        # Finish W&B run if active and not already finished due to error
+        if run and wandb.run and wandb.run.id == run.id:
              run.finish()
              print("Finished W&B run.")
             
     print(f"--- Evaluation Run Complete --- ")
-
 
 # %% ../nbs/40_evaluation.ipynb 8
 # Command-line execution block
