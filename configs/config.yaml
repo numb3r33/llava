@@ -24,18 +24,24 @@ paths:
   vqav2_test:
     annotations: vqav2/v2_mscoco_test2015_annotations.json # Placeholder VQAv2 test annotations
     images: vqav2/test2015 # Placeholder VQAv2 test images path
+    # Add questions file path if needed for evaluation script
+    questions: vqav2/v2_OpenEnded_mscoco_test2015_questions.json
   textvqa_val:
     annotations: textvqa/TextVQA_0.5.1_val.json # Placeholder TextVQA val annotations
     images: textvqa/train_images # Placeholder TextVQA val images path (often same as train)
+
+  # Custom Evaluation Set (New in Step 7.4)
+  custom_eval:
+    annotations: custom_eval/annotations.jsonl # TODO: Update path to custom eval annotations
+    images: custom_eval/images # TODO: Update path to custom eval images
+
+  # Example entries for other potential datasets (placeholders)
   # docvqa_val:
   #   annotations: docvqa/val_v1.0.json
   #   images: docvqa/val_images
   # chartqa_test:
   #   annotations: chartqa/test_human.json
   #   images: chartqa/test/png
-  # custom_eval:
-  #   annotations: custom_eval/annotations.jsonl
-  #   images: custom_eval/images
 
   # Saved model weights paths (relative to output_dir/models or absolute)
   # stage1_projector_weights defines the *input* weights for stage 2
@@ -77,13 +83,17 @@ model:
     # bias: "none"            # Typically set to "none" for LoRA
     # task_type: "CAUSAL_LM"  # Specify if required by peft version
 
-  # Adaptive Patcher configuration (initially off)
+  # Adaptive Patcher configuration - Step 6.2
   adaptive_patcher:
-    enabled: false
-    strategy: null # e.g., 'variable_resolution', 'text_guided_attention', 'predictor'
-    # Strategy-specific parameters go here
-    # e.g., for variable_resolution:
-    # resolutions: [[336, 672], [672, 336], [672, 672]]
+    enabled: true # Set to true to use the adaptive model
+    strategy: 'variable_resolution' # Strategy implemented in Step 6.2
+    # Strategy-specific parameters
+    image_grid_pinpoints: [[336, 672], [672, 336], [672, 672], [1008, 336], [336, 1008]] # Default from LLaVA-NeXT
+
+  # Vision config details needed by patcher (shared with base model)
+  vision_config:
+    image_size: 336 # Base image size for patcher reference
+    patch_size: 14  # Vision model patch size
 
   # Memory optimization - Step 4.4
   use_activation_checkpointing: false # Enable gradient checkpointing for LLM (Default to False, enable if needed)
@@ -91,7 +101,7 @@ model:
 # --- Data Handling ---
 data:
   # Image preprocessing parameters
-  image_size: 336
+  image_size: 336 # Standard resize target for baseline/stage1/stage2
   image_aspect_ratio_padding: pad # Method for resizing/padding ('pad' is common)
   # Use CLIP's processor for stats by default
   image_mean: [0.48145466, 0.4578275, 0.40821073]
@@ -116,8 +126,8 @@ data:
 training:
   # General
   seed: 42
-  num_epochs_stage1: 1
-  num_epochs_stage2: 3      # Number of epochs for Stage 2 fine-tuning
+  num_epochs_stage1: 1      # Reduce for faster runs during dev
+  num_epochs_stage2: 1      # Reduce for faster runs during dev
   learning_rate_stage1: 1e-4 # For projector in Stage 1
   learning_rate_stage2: 2e-5 # For projector & LoRA adapters in Stage 2 (typically lower)
   weight_decay: 0.
@@ -144,14 +154,14 @@ training:
 evaluation:
   eval_batch_size_per_device: 4 # Batch size for evaluation runs
   # Add specific benchmark evaluation settings if needed
-  # generation_max_length: 200 # Max tokens for generate_predictions
-  # generation_temperature: 0.2
-  # generation_top_p: null
+  generation_max_length: 200 # Max tokens for generate_predictions
+  generation_temperature: 0.2
+  generation_top_p: null # Set to e.g. 0.9 for nucleus sampling
 
 # --- Logging ---
 logging:
   wandb:
-    enabled: true
+    enabled: false # Disable W&B by default for local testing, enable for actual runs
     project: llava-adaptive-patching-fastai # TODO: Update W&B project name
     entity: # TODO: Update W&B entity (username or team) - Leave blank or null to use default entity
     log_model: false # Whether to log model checkpoints as W&B artifacts ("checkpoint" or false)
