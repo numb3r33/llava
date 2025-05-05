@@ -51,15 +51,18 @@ model:
     # Output dim should match LLM hidden dim (e.g., 4096 for Vicuna-7B)
     output_dim: 4096
 
-  # PEFT (LoRA) configuration (for Stage 2)
+  # PEFT (LoRA) configuration (for Stage 2) - Step 4.2
   peft:
-    use_lora: true
-    lora_r: 8 # LoRA rank
-    lora_alpha: 16 # LoRA alpha scaling
-    lora_dropout: 0.05
-    # Modules to apply LoRA to (check Vicuna architecture)
-    target_modules: ["q_proj", "v_proj"] # Common targets, might need adjustment
-    # You might need to add other PEFT parameters like bias, task_type etc.
+    use_lora: true          # Enable/disable LoRA for Stage 2 Fine-tuning
+    lora_r: 8               # LoRA rank (e.g., 8, 16, 32, 64) - higher rank = more params, potentially better perf.
+    lora_alpha: 16          # LoRA scaling factor (often 2*r)
+    lora_dropout: 0.05      # Dropout probability for LoRA layers
+    # Modules to apply LoRA to. Check the LLM architecture (e.g., Vicuna-7B) for valid module names.
+    # Common targets for attention mechanisms:
+    target_modules: ["q_proj", "v_proj"]
+    # You might also target "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj" depending on the model and experimental results.
+    # bias: "none"            # Typically set to "none" for LoRA
+    # task_type: "CAUSAL_LM"  # Specify if required by peft version
 
   # Adaptive Patcher configuration (initially off)
   adaptive_patcher:
@@ -70,7 +73,7 @@ model:
     # resolutions: [[336, 672], [672, 336], [672, 672]]
 
   # Memory optimization
-  use_activation_checkpointing: true # Enable gradient checkpointing for LLM
+  use_activation_checkpointing: false # Enable gradient checkpointing for LLM (Default to False, enable if needed)
 
 # --- Data Handling ---
 data:
@@ -133,10 +136,11 @@ evaluation:
 logging:
   wandb:
     enabled: true
-    project: adaptive_patching_vit # TODO: Update W&B project name
-    entity: your_wandb_entity # TODO: Update W&B entity (username or team)
+    project: llava-adaptive-patching-fastai # TODO: Update W&B project name
+    entity: # TODO: Update W&B entity (username or team) - Leave blank or null to use default entity
     log_model: false # Whether to log model checkpoints as W&B artifacts ("checkpoint" or false)
-    # Add run names/tags/notes templates if desired
+    run_name_prefix: llava # Prefix for generated run names
+    # Add run tags/notes templates if desired
 
 # --- Environment ---
 environment:
