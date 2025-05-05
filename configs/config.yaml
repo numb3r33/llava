@@ -168,6 +168,12 @@ logging:
     run_name_prefix: llava # Prefix for generated run names
     # Add run tags/notes templates if desired
 
+# --- Ablation Settings (New for Step 8.1) ---
+ablation:
+  # Set to 'baseline' to force VariableResolutionPatcher to always output 336x336 grid info.
+  # Set to null or remove to allow normal variable resolution behavior.
+  force_patcher_strategy: null # Options: null, 'baseline'
+
 # --- Environment ---
 environment:
   # Set to true if using DeepSpeed (lower priority for single GPU)
