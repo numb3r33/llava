@@ -75,44 +75,53 @@ class Conversation:
 
     def get_prompt(self) -> str:
         """Generates the prompt string based on the conversation history and style."""
+
+        # --- Handling for TWO/VICUNA Separator Style ---
+        if self.sep_style == SeparatorStyle.TWO or self.sep_style == SeparatorStyle.VICUNA:
+            seps = [self.sep, self.sep2] # Expects [space, EOS]
+            if seps[1] is None:
+                raise ValueError("SeparatorStyle.TWO/VICUNA requires both sep (sep1) and sep2 to be defined.")
+
+            # Start with system prompt + first separator (space)
+            ret = self.system + seps[0] if self.system else ""
+            # Append messages
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    # Append "ROLE: Message"
+                    ret += role + ": " + message
+                    # Append the separator based on turn index (sep1 after USER, sep2 after ASSISTANT)
+                    ret += seps[i % 2]
+                else: # Handle prompt marker (message is None)
+                    ret += role + ":" # Append "ASSISTANT:", no separators needed after marker
+            return ret # Return directly
+
+        # --- Handling for other Separator Styles ---
         ret = ""
-        # Handle system prompt
-        if self.sep_style == SeparatorStyle.PLAIN:
-            pass # Plain has no system prompt logic here
-        elif self.system:
+        if self.system:
             ret += self.system
             if self.sep_style != SeparatorStyle.CHATML: # CHATML handles sep differently
-                 ret += self.sep # Add primary separator (e.g., space for Vicuna)
+                 ret += self.sep
 
-        # Format messages
+        # Format messages for non-TWO/VICUNA styles
         for i, (role, message) in enumerate(self.messages):
             if message: # Handle actual messages
-                if self.sep_style == SeparatorStyle.TWO or self.sep_style == SeparatorStyle.VICUNA:
-                    ret += role + ": " + message # Add "ROLE: Message"
-                    if role == self.roles[1] and self.sep2: # If assistant turn and sep2 exists
-                        ret += self.sep2 # Add EOS: "...Message</s>"
-                    # Add primary separator (space) *unless* it's the last message
-                    if i < len(self.messages) - 1:
-                         ret += self.sep
+                if self.sep_style == SeparatorStyle.PLAIN:
+                     ret += role + message + self.sep
                 elif self.sep_style == SeparatorStyle.CHATML:
-                    ret += role + "\n" + message + self.sep + ("\n" if i < len(self.messages)-1 else "")
-                elif self.sep_style == SeparatorStyle.PLAIN:
-                    ret += role + message + self.sep
+                     ret += role + "\n" + message + self.sep + ("\n" if i < len(self.messages)-1 else "")
+                # Add other specific style logic here if needed
                 else: # Default/Fallback
                     ret += role + message + self.sep
-            else: # Handle prompt markers (message is None) - typically for assistant
-                if self.sep_style == SeparatorStyle.TWO or self.sep_style == SeparatorStyle.VICUNA:
-                    ret += role + ":" # Just add "ASSISTANT:", no separators here
+            else: # Handle prompt markers (message is None)
+                if self.sep_style == SeparatorStyle.PLAIN:
+                     ret += role + self.sep
                 elif self.sep_style == SeparatorStyle.CHATML:
-                    ret += role + "\n"
-                elif self.sep_style == SeparatorStyle.PLAIN:
-                    ret += role + self.sep
+                     ret += role + "\n"
+                # Add other specific style logic here if needed
                 else:
-                    ret += role
+                     ret += role
 
-        # --- Final Cleanup ---
-        # The loop structure should now correctly place separators for Vicuna
-        # For Plain style, ensure only one trailing separator if specified
+        # --- Final Cleanup for PLAIN ---
         if self.sep_style == SeparatorStyle.PLAIN:
              if self.sep:
                  ret = ret.rstrip() # Remove any trailing whitespace first
