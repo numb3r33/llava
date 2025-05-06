@@ -17,7 +17,7 @@ paths:
 
   # Stage 2: Instruction Fine-tuning Data (e.g., LLaVA-Instruct-150K)
   stage2_data: llava_instruct_150k/llava_v1_5_mix665k.jsonl # Example JSON Lines file
-  stage2_images: . # Base dir for images referenced in stage 2 data (can be multiple sources, resolved via path in JSONL)
+  stage2_images: llava_instruct_150k/train2017/images # Base dir for images referenced in stage 2 data (can be multiple sources, resolved via path in JSONL)
 
   # Evaluation dataset paths (relative to data_base or absolute)
   # Keys should match dataset_name used in evaluation scripts
