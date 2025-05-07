@@ -198,66 +198,208 @@ class VariableResolutionPatcher(AdaptivePatcher):
             
         return best_fit_grid
 
-    def forward(
-        self,
-        pixel_values: Optional[torch.Tensor] = None, # Not used by this patcher
-        text_features: Optional[torch.Tensor] = None, # Not used by this patcher
-        raw_image: Optional[Image.Image] = None,
-        **kwargs
-    ) -> Tuple[None, Dict[str, Any]]: # Returns None for features, Dict for metadata
-        """Determines the best grid resolution based on the raw image's aspect ratio
-           or returns the baseline grid if forced by ablation config.
+    def forward(self,
+                *args: Any, # Accept positional args for flexibility
+                pixel_values: Optional[torch.Tensor] = None,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
+                # Add raw_images potentially needed by patcher (extract from kwargs or batch dict)
+                raw_images: Optional[List[Image.Image]] = None,
+                **kwargs: Any # Accept keyword args
+               ) -> CausalLMOutputWithPast: # Return type from transformers
+        """Defines the forward pass of the Adaptive LLaVA model.
+
+        Handles input flexibility. If an adaptive patcher is enabled, it's called first
+        to potentially determine processing strategy metadata. Currently, the image features
+        used still come from the standard `pixel_values` input, pending full adaptive implementation.
 
         Args:
-            raw_image: The original PIL Image object (ignored if force_baseline=True).
-            pixel_values: Ignored by this patcher.
-            text_features: Ignored by this patcher.
-            **kwargs: Ignored.
+            *args: Positional arguments. If args[0] is a dictionary, it's treated as the batch. If args[0] is a Tensor, it might be pixel_values.
+            pixel_values (Optional[torch.Tensor]): Tensor of image pixel values.
+            input_ids (Optional[torch.Tensor]): Tensor of input token IDs, potentially containing image markers (-200).
+            attention_mask (Optional[torch.Tensor]): Attention mask for input_ids.
+            labels (Optional[torch.Tensor]): Labels for language modeling loss (shifted internally).
+            raw_images (Optional[List[PIL.Image.Image]]): List of raw PIL images for the batch, if needed by the patcher.
+            **kwargs: Keyword arguments, potentially containing the input tensors or 'raw_images'.
 
         Returns:
-            A tuple containing:
-            - None: This patcher does not directly return processed features.
-            - Dict[str, Any]: Metadata including:
-                - 'strategy': 'variable_resolution' or 'forced_baseline'
-                - 'selected_grid' (Tuple[int, int]): The chosen grid dimensions (H, W).
-                - 'num_patches_h' (int): Number of patches vertically in the grid.
-                - 'num_patches_w' (int): Number of patches horizontally in the grid.
-                - 'total_patches' (int): Total number of patches in the selected grid.
-
-        Raises:
-            ValueError: If raw_image is not provided (and baseline is not forced) or patch_size is invalid.
+            Output dictionary from the language model (transformers.CausalLMOutputWithPast).
         """
-        selected_grid_h, selected_grid_w = self.base_grid
-        strategy_name = 'variable_resolution'
+        # --- Input Parsing Logic (Handles *args, **kwargs, dict in args[0], tensor in args[0]) ---
+        _pixel_values, _input_ids, _attention_mask, _labels, _raw_images = None, None, None, None, None
+        batch_dict = None
 
-        if self.force_baseline:
-            strategy_name = 'forced_baseline'
-            # Use the predefined base grid
-            selected_grid_h, selected_grid_w = self.base_grid
+        # Case 1: fastai standard case (batch dict in args[0])
+        if len(args) == 1 and isinstance(args[0], dict):
+            batch_dict = args[0]
+            _pixel_values = batch_dict.get('pixel_values')
+            _input_ids = batch_dict.get('input_ids')
+            _attention_mask = batch_dict.get('attention_mask')
+            _labels = batch_dict.get('labels')
+            _raw_images = batch_dict.get('raw_images') # Try getting raw_images from dict
+        # Case 2: Try kwargs next
+        elif kwargs:
+            _pixel_values = kwargs.get('pixel_values', pixel_values)
+            _input_ids = kwargs.get('input_ids', input_ids)
+            _attention_mask = kwargs.get('attention_mask', attention_mask)
+            _labels = kwargs.get('labels', labels)
+            _raw_images = kwargs.get('raw_images', raw_images) # Get raw_images from kwargs
+        # Case 3: Check if only pixel_values was passed positionally (e.g., summary)
+        elif len(args) == 1 and isinstance(args[0], torch.Tensor) and pixel_values is None:
+             _pixel_values = args[0]
+             # Attempt to get others from formal params (likely None)
+             _input_ids = input_ids
+             _attention_mask = attention_mask
+             _labels = labels
+             _raw_images = raw_images # Get raw_images from formal params
+        # Case 4: Fallback to formal parameters if nothing else worked
         else:
-            if raw_image is None:
-                raise ValueError("VariableResolutionPatcher requires the 'raw_image' input when not forcing baseline.")
-            original_width, original_height = raw_image.size
-            # Select the best grid based on aspect ratio
-            selected_grid_h, selected_grid_w = self.select_best_resolution(original_height, original_width)
-            
-        # Calculate number of patches for the selected grid
-        if self.patch_size <= 0:
-            raise ValueError("Patch size must be positive.")
-        num_patches_h = selected_grid_h // self.patch_size
-        num_patches_w = selected_grid_w // self.patch_size
-        total_patches = num_patches_h * num_patches_w
-        
-        metadata = {
-            'strategy': strategy_name,
-            'selected_grid': (selected_grid_h, selected_grid_w),
-            'num_patches_h': num_patches_h,
-            'num_patches_w': num_patches_w,
-            'total_patches': total_patches
-        }
-        
-        # This patcher returns metadata for the main model to use, not processed features.
-        return None, metadata
+             _pixel_values = pixel_values
+             _input_ids = input_ids
+             _attention_mask = attention_mask
+             _labels = labels
+             _raw_images = raw_images
+
+        # --- Handle learner.summary() potentially needing dummy text inputs ---
+        if _pixel_values is not None and _input_ids is None:
+            warnings.warn("Adaptive forward() received pixel_values but not input_ids after parsing. "
+                          "Creating dummy text inputs (likely for learner.summary()).", UserWarning)
+            batch_size = _pixel_values.shape[0]
+            dummy_seq_len = 1
+            target_device = _pixel_values.device
+            if tokenizer is None: raise RuntimeError("Tokenizer not available for dummy inputs.")
+
+            _input_ids = torch.full(
+                (batch_size, dummy_seq_len),
+                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+                dtype=torch.long,
+                device=target_device
+            )
+            _input_ids[:, 0] = self.image_token_index_marker
+            _attention_mask = torch.ones_like(_input_ids)
+            _labels = None
+            _raw_images = None # No raw images needed/available for dummy case
+
+        # --- Final check for essential inputs ---
+        if _pixel_values is None or _input_ids is None:
+            err_msg_parts = ["Adaptive forward() missing required arguments after parsing: pixel_values and input_ids must be provided."]
+            # ... (add more details as needed) ...
+            raise ValueError("\n".join(err_msg_parts))
+
+        # Use resolved values from here on
+        pixel_values, input_ids, attention_mask, labels, raw_images = _pixel_values, _input_ids, _attention_mask, _labels, _raw_images
+        # --- End Input Parsing & Dummy Input Handling ---
+
+
+        # --- Patcher Logic (Get Metadata) ---
+        patcher_metadata_batch = [None] * pixel_values.shape[0] # Initialize metadata list
+        if self.patcher is not None:
+            # Pass necessary inputs to the patcher
+            # Currently VariableResolutionPatcher only needs raw_image if not forced baseline
+            requires_raw = not getattr(self.patcher, 'force_baseline', False)
+            if requires_raw and (raw_images is None or len(raw_images) != pixel_values.shape[0]):
+                 warnings.warn(f"Patcher '{self.patcher.__class__.__name__}' needs raw_images, but they were not provided or length mismatch.", UserWarning)
+                 # Decide behavior: Proceed without metadata, or raise error? For now, proceed.
+            elif requires_raw or getattr(self.patcher, 'force_baseline', False): # Run if raw needed or baseline forced
+                for i in range(pixel_values.shape[0]):
+                    try:
+                        current_raw_image = raw_images[i] if raw_images else None
+                        # Pass only the necessary inputs to the patcher's forward
+                        _, patcher_metadata_sample = self.patcher(raw_image=current_raw_image)
+                        patcher_metadata_batch[i] = patcher_metadata_sample
+                    except Exception as e:
+                        warnings.warn(f"Error running patcher for batch index {i}: {e}")
+                self.current_patcher_metadata = patcher_metadata_batch # Store for inspection
+        # --- End Patcher Logic ---
+
+        # --- Feature Processing (Currently Still Baseline Behavior) ---
+        # TODO: Modify this section based on `patcher_metadata_batch`.
+        # This currently ignores the patcher output metadata and uses baseline features.
+
+        if self.language_model is None or self.vision_tower is None or self.projector is None:
+            raise RuntimeError("Model components (LLM, Vision Tower, Projector) are not fully loaded.")
+
+        image_features = self.encode_image(pixel_values) # (B, P_base, D_clip)
+        if image_features is None:
+            raise RuntimeError("Image encoding failed.")
+
+        projector_device = next(self.projector.parameters()).device
+        projector_dtype = next(self.projector.parameters()).dtype
+        image_features = image_features.to(projector_device, dtype=projector_dtype)
+        projected_image_features = self.projector(image_features) # (B, P_base, D_llm)
+        num_image_patches = projected_image_features.shape[1]
+
+        # --- Prepare LLM inputs (Same as baseline) ---
+        embedding_layer = self.get_input_embeddings()
+        target_device = embedding_layer.weight.device
+        target_dtype = embedding_layer.weight.dtype
+
+        input_ids_clone = input_ids.clone().to(target_device)
+        input_ids_clone[input_ids_clone == self.image_token_index_marker] = 0
+
+        text_embeddings = embedding_layer(input_ids_clone)
+        projected_image_features = projected_image_features.to(target_device, dtype=target_dtype)
+
+        new_input_embeds = []
+        new_labels = [] if labels is not None else None
+        new_attention_mask = []
+
+        for batch_idx in range(input_ids.shape[0]):
+            current_input_ids_slice = input_ids[batch_idx].to(target_device)
+            image_token_indices = torch.where(current_input_ids_slice == self.image_token_index_marker)[0]
+
+            if len(image_token_indices) == 0:
+                warnings.warn(f"Image token placeholder {self.image_token_index_marker} not found in batch index {batch_idx}. Using text embeddings only.", UserWarning)
+                new_input_embeds.append(text_embeddings[batch_idx])
+                current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+                new_attention_mask.append(current_attention_mask_slice)
+                if new_labels is not None and labels is not None:
+                    new_labels.append(labels[batch_idx].to(target_device))
+                continue
+
+            image_token_start_index = image_token_indices[0].item()
+            text_emb_before = text_embeddings[batch_idx, :image_token_start_index]
+            text_emb_after = text_embeddings[batch_idx, image_token_start_index + 1:]
+
+            cur_new_embed = torch.cat([
+                text_emb_before,
+                projected_image_features[batch_idx],
+                text_emb_after
+            ], dim=0)
+            new_input_embeds.append(cur_new_embed)
+
+            current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+            mask_before = current_attention_mask_slice[:image_token_start_index]
+            mask_image = torch.ones(num_image_patches, dtype=torch.long, device=target_device)
+            mask_after = current_attention_mask_slice[image_token_start_index + 1:]
+            cur_new_mask = torch.cat([mask_before, mask_image, mask_after], dim=0)
+            new_attention_mask.append(cur_new_mask)
+
+            if new_labels is not None and labels is not None:
+                current_labels_slice = labels[batch_idx].to(target_device)
+                label_before = current_labels_slice[:image_token_start_index]
+                label_image = torch.full((num_image_patches,), self.ignore_index, dtype=torch.long, device=target_device)
+                label_after = current_labels_slice[image_token_start_index + 1:]
+                cur_new_label = torch.cat([label_before, label_image, label_after], dim=0)
+                new_labels.append(cur_new_label)
+
+        # --- Padding (Same as baseline) ---
+        padded_input_embeds = pad_sequence(new_input_embeds, batch_first=True, padding_value=0.0)
+        padded_attention_mask = pad_sequence(new_attention_mask, batch_first=True, padding_value=0)
+        padded_labels = None
+        if new_labels is not None and len(new_labels) > 0:
+            padded_labels = pad_sequence(new_labels, batch_first=True, padding_value=self.ignore_index)
+
+        # --- Pass to LLM (Same as baseline) ---
+        outputs: CausalLMOutputWithPast = self.language_model(
+            inputs_embeds=padded_input_embeds,
+            attention_mask=padded_attention_mask,
+            labels=padded_labels, # Pass potentially None labels
+            return_dict=True
+        )
+
+        return outputs
 
 # %% ../../nbs/21_model_adaptive.ipynb 16
 # Placeholder for other potential patcher implementations
@@ -288,7 +430,7 @@ class AdaptiveLLaVAModel(BaselineLLaVAModel):
         """
         # Initialize baseline components (Vision Tower, LLM, Projector)
         super().__init__(config)
-        
+
         self.patcher = None
         patcher_config = self.config.get('model', {}).get('adaptive_patcher', {})
         patcher_enabled = patcher_config.get('enabled', False)
@@ -310,15 +452,17 @@ class AdaptiveLLaVAModel(BaselineLLaVAModel):
         else:
             print("Adaptive Patcher is disabled in the configuration.")
 
-    # --- Step 6.5: Implement Adaptive Forward Pass --- 
+    # --- Step 6.5: Implement Adaptive Forward Pass ---
     # Override the forward pass to integrate the patcher logic
-    def forward(self, 
-                pixel_values: torch.Tensor,
-                input_ids: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None, 
+    def forward(self,
+                *args: Any, # Accept positional args for flexibility
+                pixel_values: Optional[torch.Tensor] = None,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
-                # Add raw_images potentially needed by patcher
-                raw_images: Optional[List[Image.Image]] = None 
+                # Add raw_images potentially needed by patcher (extract from kwargs or batch dict)
+                raw_images: Optional[List[Image.Image]] = None,
+                **kwargs: Any # Accept keyword args
                ) -> CausalLMOutputWithPast: # Return type from transformers
         """Defines the forward pass of the Adaptive LLaVA model.
 
@@ -326,32 +470,81 @@ class AdaptiveLLaVAModel(BaselineLLaVAModel):
         (metadata stored). The actual image features used currently come from the standard
         `pixel_values` input (base resolution), regardless of patcher output. This allows
         the structural integration without implementing complex variable feature handling yet.
-        
-        **Note:** For ablation studies, the patcher might be forced to return baseline metadata.
-        The actual processing logic based on metadata (variable number of patches, etc.) 
-        is **not yet implemented** here; this forward pass currently behaves like the baseline.
+
+        Handles input flexibility for compatibility with fastai Learner.
 
         Args:
-            pixel_values: Tensor of shape (batch_size, C, H, W) for the base resolution (e.g., 336x336).
-            input_ids: Tensor of shape (batch_size, sequence_length) containing token IDs
-                       and IMAGE_TOKEN_INDEX_PLACEHOLDER markers (-200).
-            attention_mask: Optional tensor of shape (batch_size, sequence_length).
-            labels: Optional tensor of shape (batch_size, sequence_length) corresponding
-                    to input_ids (with -100 masking) for loss calculation.
-            raw_images: Optional list of PIL Images for the batch, needed by some patchers.
+            *args: Positional arguments. If args[0] is a dictionary, it's treated as the batch. If args[0] is a Tensor, it might be pixel_values.
+            pixel_values (Optional[torch.Tensor]): Tensor of image pixel values.
+            input_ids (Optional[torch.Tensor]): Tensor of input token IDs, potentially containing image markers (-200).
+            attention_mask (Optional[torch.Tensor]): Attention mask for input_ids.
+            labels (Optional[torch.Tensor]): Labels for language modeling loss (shifted internally).
+            raw_images (Optional[List[PIL.Image.Image]]): List of raw PIL images for the batch, if needed by the patcher.
+            **kwargs: Keyword arguments, potentially containing the input tensors or 'raw_images'.
 
         Returns:
             Output dictionary from the language model (transformers.CausalLMOutputWithPast).
         """
-        # print("AdaptiveLLaVAModel forward pass called.") # Debug print
-        patcher_metadata_batch = [None] * pixel_values.shape[0] # Initialize metadata list
+        # --- Input Parsing Logic (Handles *args, **kwargs, dict in args[0], tensor in args[0]) ---
+        _pixel_values, _input_ids, _attention_mask, _labels, _raw_images = None, None, None, None, None
+        batch_dict = {}
 
-        # --- Patcher Logic (Get Metadata) --- 
+        if len(args) == 1 and isinstance(args[0], dict):
+            batch_dict = args[0]
+            _pixel_values = batch_dict.get('pixel_values')
+            _input_ids = batch_dict.get('input_ids')
+            _attention_mask = batch_dict.get('attention_mask')
+            _labels = batch_dict.get('labels')
+            _raw_images = batch_dict.get('raw_images')
+        elif len(args) == 1 and isinstance(args[0], torch.Tensor):
+            _pixel_values = args[0]
+        
+        # Prioritize kwargs, then formal params if not found elsewhere
+        if _pixel_values is None: _pixel_values = kwargs.get('pixel_values', pixel_values)
+        if _input_ids is None: _input_ids = kwargs.get('input_ids', input_ids)
+        if _attention_mask is None: _attention_mask = kwargs.get('attention_mask', attention_mask)
+        if _labels is None: _labels = kwargs.get('labels', labels)
+        if _raw_images is None: _raw_images = kwargs.get('raw_images', raw_images)
+
+        # --- Handle learner.summary() case: Create dummy text inputs ---
+        is_summary_call = (_pixel_values is not None and _input_ids is None)
+        if is_summary_call:
+            # print("Warning: input_ids not provided, creating dummy inputs for summary/tracing.") # Optional warning
+            batch_size = _pixel_values.shape[0]
+            dummy_seq_len = 1 # Minimal sequence length
+            target_device = _pixel_values.device 
+            if tokenizer is None: raise RuntimeError("Tokenizer not available to create dummy inputs.")
+            
+            _input_ids = torch.full(
+                (batch_size, dummy_seq_len),
+                tokenizer.pad_token_id,
+                dtype=torch.long,
+                device=target_device
+            )
+            _attention_mask = torch.zeros_like(_input_ids)
+            _labels = None
+        
+        # --- Final check for essential inputs ---
+        if _pixel_values is None or _input_ids is None:
+            err_msg_parts = ["Adaptive forward() missing required arguments: pixel_values and input_ids must be provided."]
+            err_msg_parts.append(f"  Resolved pixel_values is None: {_pixel_values is None}")
+            err_msg_parts.append(f"  Resolved input_ids is None: {_input_ids is None}")
+            err_msg_parts.append(f"  len(args): {len(args)}, type(args[0]) if args else 'N/A': {type(args[0]) if args else 'N/A'}")
+            err_msg_parts.append(f"  kwargs keys: {list(kwargs.keys())}")
+            raise ValueError("\n".join(err_msg_parts))
+
+        # Use resolved values from here on
+        pixel_values, input_ids, attention_mask, labels, raw_images = _pixel_values, _input_ids, _attention_mask, _labels, _raw_images
+        # --- End Input Parsing & Dummy Input Handling ---
+
+
+        # --- Patcher Logic (Get Metadata) ---
+        patcher_metadata_batch = [None] * pixel_values.shape[0] # Initialize metadata list
         if self.patcher is not None:
-            # Only require raw_images if not forcing baseline (baseline doesn't need raw image)
             requires_raw = not getattr(self.patcher, 'force_baseline', False)
             if requires_raw and (raw_images is None or len(raw_images) != pixel_values.shape[0]):
-                 warnings.warn("Patcher is active and needs raw_images, but they were not provided or length mismatch. Patcher cannot run.")
+                 warnings.warn(f"Patcher '{self.patcher.__class__.__name__}' is active and needs raw_images, but they were not provided or length mismatch. Patcher cannot run effectively.", UserWarning)
+                 # Proceed without patcher metadata if raw images are missing when needed
             else:
                 # Iterate through batch to get metadata for each sample
                 for i in range(pixel_values.shape[0]):
@@ -359,89 +552,102 @@ class AdaptiveLLaVAModel(BaselineLLaVAModel):
                         current_raw_image = raw_images[i] if raw_images else None
                         _, patcher_metadata_sample = self.patcher(raw_image=current_raw_image)
                         patcher_metadata_batch[i] = patcher_metadata_sample
-                        # print(f"Batch {i} Patcher metadata: {patcher_metadata_sample}") # Debug print
                     except Exception as e:
                         warnings.warn(f"Error running patcher for batch index {i}: {e}")
-                # Store or log patcher_metadata_batch if needed
-                # Currently, we log/print but don't change the feature processing path.
                 self.current_patcher_metadata = patcher_metadata_batch # Store for potential inspection/logging
-        
-        # --- Feature Processing (Currently Still Baseline Behavior) --- 
-        # TODO: Modify this section to use `patcher_metadata_batch` to handle variable features.
-        # This would involve either: 
-        #   a) Dynamically processing images based on metadata (complex batching).
-        #   b) Pre-processing multiple image resolutions/patches, encoding all, then selecting/
-        #      combining features based on metadata here.
 
-        # 1. Encode Image (using standard pixel_values) & Project Features
+        # --- Feature Processing (Currently Still Baseline Behavior) ---
+        # TODO: Modify this section based on `patcher_metadata_batch`.
+        # For now, it proceeds exactly like the baseline model using the standard pixel_values input.
+
+        if self.language_model is None or self.vision_tower is None or self.projector is None:
+            raise RuntimeError("Model components (LLM, Vision Tower, Projector) are not fully loaded.")
+
         image_features = self.encode_image(pixel_values) # (B, P_base, D_clip)
         if image_features is None:
             raise RuntimeError("Image encoding failed.")
+
+        projector_device = next(self.projector.parameters()).device
+        image_features = image_features.to(projector_device)
         projected_image_features = self.projector(image_features) # (B, P_base, D_llm)
         num_image_patches = projected_image_features.shape[1]
 
-        # --- Prepare LLM inputs (Same as baseline) --- 
-        input_ids_clone = input_ids.clone()
-        input_ids_clone[input_ids_clone == self.image_token_index_marker] = 0 
-        text_embeddings = self.get_input_embeddings()(input_ids_clone) 
+        # --- Prepare LLM inputs (Same as baseline) ---
+        embedding_layer = self.get_input_embeddings()
+        target_device = embedding_layer.weight.device
+
+        input_ids_clone = input_ids.clone().to(target_device)
+        input_ids_clone[input_ids_clone == self.image_token_index_marker] = 0
+
+        text_embeddings = embedding_layer(input_ids_clone)
+        projected_image_features = projected_image_features.to(target_device, dtype=text_embeddings.dtype)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         new_attention_mask = []
 
         for batch_idx in range(input_ids.shape[0]):
-            image_token_indices = torch.where(input_ids[batch_idx] == self.image_token_index_marker)[0]
+            current_input_ids_slice = input_ids[batch_idx].to(target_device)
+            image_token_indices = torch.where(current_input_ids_slice == self.image_token_index_marker)[0]
+
             if len(image_token_indices) == 0:
-                warnings.warn(f"Image token placeholder {self.image_token_index_marker} not found in batch index {batch_idx}. Skipping image features.")
-                new_input_embeds.append(text_embeddings[batch_idx])
-                current_attention_mask = attention_mask[batch_idx] if attention_mask is not None else (input_ids[batch_idx] != tokenizer.pad_token_id).long()
-                new_attention_mask.append(current_attention_mask)
-                if new_labels is not None and labels is not None:
-                    new_labels.append(labels[batch_idx])
-                continue
+                # If using dummy inputs, image marker won't be found, handle gracefully.
+                if is_summary_call:
+                    new_input_embeds.append(text_embeddings[batch_idx])
+                    current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else torch.zeros_like(current_input_ids_slice)
+                    new_attention_mask.append(current_attention_mask_slice)
+                else: # Normal operation, warn if marker is missing
+                    warnings.warn(f"Image token placeholder {self.image_token_index_marker} not found in batch index {batch_idx}. Skipping image features.")
+                    new_input_embeds.append(text_embeddings[batch_idx])
+                    current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+                    new_attention_mask.append(current_attention_mask_slice)
+                    if new_labels is not None and labels is not None:
+                        new_labels.append(labels[batch_idx].to(target_device))
+                continue # Move to next item in batch
 
             image_token_start_index = image_token_indices[0].item()
+            # Ensure indices are valid before slicing
+            if image_token_start_index >= text_embeddings.shape[1]:
+                 warnings.warn(f"Calculated image_token_start_index {image_token_start_index} is out of bounds for text_embeddings shape {text_embeddings.shape}. Skipping.")
+                 new_input_embeds.append(text_embeddings[batch_idx])
+                 new_attention_mask.append(attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long())
+                 if new_labels is not None and labels is not None: new_labels.append(labels[batch_idx].to(target_device))
+                 continue
+
 
             text_emb_before = text_embeddings[batch_idx, :image_token_start_index]
             text_emb_after = text_embeddings[batch_idx, image_token_start_index + 1:]
 
             cur_new_embed = torch.cat([
                 text_emb_before,
-                projected_image_features[batch_idx].to(text_embeddings.device, dtype=text_embeddings.dtype),
+                projected_image_features[batch_idx],
                 text_emb_after
             ], dim=0)
             new_input_embeds.append(cur_new_embed)
 
-            current_attention_mask = attention_mask[batch_idx] if attention_mask is not None else (input_ids[batch_idx] != tokenizer.pad_token_id).long()
-            mask_before = current_attention_mask[:image_token_start_index]
-            mask_image = torch.ones(num_image_patches, dtype=torch.long, device=current_attention_mask.device)
-            mask_after = current_attention_mask[image_token_start_index + 1:]
-            cur_new_mask = torch.cat([
-                mask_before,
-                mask_image,
-                mask_after
-            ], dim=0)
+            current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+            mask_before = current_attention_mask_slice[:image_token_start_index]
+            mask_image = torch.ones(num_image_patches, dtype=torch.long, device=target_device)
+            mask_after = current_attention_mask_slice[image_token_start_index + 1:]
+            cur_new_mask = torch.cat([mask_before, mask_image, mask_after], dim=0)
             new_attention_mask.append(cur_new_mask)
 
             if new_labels is not None and labels is not None:
-                label_before = labels[batch_idx, :image_token_start_index]
-                label_image = torch.full((num_image_patches,), self.ignore_index, dtype=torch.long, device=labels.device)
-                label_after = labels[batch_idx, image_token_start_index + 1:]
-                cur_new_label = torch.cat([
-                    label_before,
-                    label_image,
-                    label_after
-                ], dim=0)
+                current_labels_slice = labels[batch_idx].to(target_device)
+                label_before = current_labels_slice[:image_token_start_index]
+                label_image = torch.full((num_image_patches,), self.ignore_index, dtype=torch.long, device=target_device)
+                label_after = current_labels_slice[image_token_start_index + 1:]
+                cur_new_label = torch.cat([label_before, label_image, label_after], dim=0)
                 new_labels.append(cur_new_label)
 
-        # --- Padding (Same as baseline) --- 
+        # --- Padding (Same as baseline) ---
         padded_input_embeds = pad_sequence(new_input_embeds, batch_first=True, padding_value=0.0)
         padded_attention_mask = pad_sequence(new_attention_mask, batch_first=True, padding_value=0)
         padded_labels = None
         if new_labels is not None:
             padded_labels = pad_sequence(new_labels, batch_first=True, padding_value=self.ignore_index)
 
-        # --- Pass to LLM (Same as baseline) --- 
+        # --- Pass to LLM (Same as baseline) ---
         outputs: CausalLMOutputWithPast = self.language_model(
             inputs_embeds=padded_input_embeds,
             attention_mask=padded_attention_mask,

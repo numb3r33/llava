@@ -72,7 +72,7 @@ try:
     from llava.data.loading import get_stage2_dataloaders
     from llava.model.baseline import BaselineLLaVAModel
     from llava.model.adaptive import AdaptiveLLaVAModel # Added Adaptive model
-    from llava.training.core import LLaVALoss
+    from llava.training.core import LLaVALoss, LLaVAMixedPrecision
 except ImportError as e:
      print(f"Error importing llava modules: {e}")
      print("Ensure that nbdev_export has been run and the llava library is installed/accessible.")
@@ -376,7 +376,7 @@ def _get_stage2_learner_internal(config: dict, model_class: Type[nn.Module], spl
     
     use_mixed_precision = config.get('training', {}).get('use_mixed_precision', False)
     if use_mixed_precision:
-        cbs.append(MixedPrecision())
+        cbs.append(LLaVAMixedPrecision())
         print("Added MixedPrecision callback.")
 
     # 8. Create Learner

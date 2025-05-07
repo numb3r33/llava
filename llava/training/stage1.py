@@ -12,6 +12,8 @@ import os
 import gc # For memory cleanup
 import argparse # For command-line execution
 
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Assumes the notebook is run from the project root or one level down (e.g., nbs/)
 # Navigate up to the project root (where settings.ini or .git likely exists)
 project_root = Path(os.getcwd())
@@ -29,6 +31,8 @@ else:
 
 # %% ../../nbs/31_training_stage1.ipynb 4
 import torch
+import warnings
+
 from fastai.learner import Learner
 from fastai.vision.all import * # For splitter
 
@@ -45,14 +49,15 @@ import PIL.Image # For dummy data creation
 from ..utils import load_config, init_wandb
 from ..data.loading import get_stage1_dataloaders
 from ..model.baseline import BaselineLLaVAModel
-from .core import LLaVALoss
+from .core import LLaVALoss, LLaVAMixedPrecision, extract_loss_from_output, SafeGradientAccumulation
 
 # %% ../../nbs/31_training_stage1.ipynb 7
 def llava_stage1_splitter(model: BaselineLLaVAModel):
     """Splits the `BaselineLLaVAModel` parameters for Stage 1 training.
     
-    Only the parameters of the `projector` module are marked as trainable.
-    The `vision_tower` and `language_model` parameters will remain frozen.
+    Only the parameters of the `projector` module are marked as trainable for the optimizer.
+    Vision tower is frozen. LLM's LoRA adapters (if any) remain trainable but won't be
+    passed to the optimizer in Stage 1. Base LLM weights are frozen (by PEFT or explicitly).
     
     Args:
         model: An instance of `BaselineLLaVAModel`.
@@ -63,28 +68,37 @@ def llava_stage1_splitter(model: BaselineLLaVAModel):
     if not hasattr(model, 'projector') or model.projector is None:
         raise AttributeError("Model does not have a 'projector' attribute or it is None.")
         
-    print("Applying Stage 1 splitter: Training only the projector.")
-    # Fastai's `params` function selects parameters from the given module(s)
-    # Only parameters returned by the splitter are trained.
-    trainable_params = list(model.projector.parameters())
+    print("Applying Stage 1 splitter: Ensuring only projector parameters are passed to optimizer.")
     
-    # Verify that projector parameters require grad
-    # They should by default unless explicitly frozen, but good to check
-    for p in trainable_params:
-         p.requires_grad = True # Ensure they are trainable
-            
-    # Ensure other parts are frozen (should be done during model init, but double-check)
+    trainable_params = []
+    # Ensure projector parameters are trainable
+    if hasattr(model, 'projector') and model.projector is not None:
+        print("  - Setting projector parameters to require_grad=True.")
+        for p in model.projector.parameters():
+            p.requires_grad = True
+        trainable_params.extend(list(model.projector.parameters()))
+    
+    # Ensure vision tower is frozen
     if hasattr(model, 'vision_tower') and model.vision_tower is not None:
+        print("  - Setting vision_tower parameters to require_grad=False.")
         for p in model.vision_tower.parameters():
             p.requires_grad = False
-    if hasattr(model, 'language_model') and model.language_model is not None:
-        # Note: If PEFT is somehow applied here (it shouldn't be for stage 1),
-        # this would wrongly freeze LoRA adapters. This assumes base LLM is frozen.
-        for p in model.language_model.parameters():
-            p.requires_grad = False
             
-    # Return a list containing one group of trainable parameters (the projector's)
-    return [trainable_params]
+    # For the language model in Stage 1:
+    # - If PEFT/LoRA is used, get_peft_model has already frozen base weights and made adapters trainable.
+    #   We do NOT want to turn off grads for LoRA adapters here.
+    # - If no PEFT/LoRA, the base LLM should be frozen. This is handled in model.__init__
+    #   by the `self.language_model.requires_grad_(False)` call if not QLoRA/LoRA.
+    # So, the splitter's main job for Stage 1 regarding LLM is *not* to modify its requires_grad state
+    # but to ensure only projector params are given to the optimizer.
+    # The `model.__init__` handles initial freezing.
+
+    if not trainable_params:
+         raise ValueError("Splitter function resulted in no trainable parameters for Stage 1 (projector).")
+    
+    print(f"  - Stage 1 Splitter will provide {len(trainable_params)} projector parameters to the optimizer.")
+    # The optimizer will only receive these parameters.
+    return trainable_params # This was already correct, the issue was modifying LLM params.
 
 # %% ../../nbs/31_training_stage1.ipynb 11
 def get_stage1_learner(config: dict) -> Learner:
@@ -128,16 +142,23 @@ def get_stage1_learner(config: dict) -> Learner:
         raise RuntimeError("Failed to instantiate baseline model.") from e
 
     # 3. Define Loss Function
-    loss_func = LLaVALoss()
+    # loss_func = LLaVALoss()
+    loss_func = extract_loss_from_output # Use the extractor function
+    print(f"Loss function: {loss_func.__name__}")
     print(f"Loss function: {type(loss_func).__name__}")
 
     # 4. Define Optimizer
     # AdamW is generally preferred for transformer models
     lr = config.get('training', {}).get('learning_rate_stage1', 1e-4)
     wd = config.get('training', {}).get('weight_decay', 0.0)
+    
+    
     opt_func = partial(Adam, lr=lr, wd=wd, eps=1e-8) # Added eps for numerical stability
-    print(f"Optimizer: AdamW (lr={lr}, wd={wd})")
+    print(f"Optimizer: Adam (lr={lr}, wd={wd})")
 
+    # opt_func = AdamW # Pass the optimizer class directly
+    # print(f"Optimizer: AdamW (lr will be set by Learner/fit_one_cycle, default wd={wd})") # 
+    
     # 5. Define Splitter
     splitter = llava_stage1_splitter
     print(f"Parameter splitter: {splitter.__name__}")
@@ -179,13 +200,24 @@ def get_stage1_learner(config: dict) -> Learner:
     # --- Add Optimization Callbacks (Step 3.3 Implementation) --- 
     grad_accum_steps = config.get('training', {}).get('gradient_accumulation_steps', 1)
     if grad_accum_steps > 1:
-        cbs.append(GradientAccumulation(grad_accum_steps))
-        print(f"Added GradientAccumulation callback with {grad_accum_steps} steps.")
+        cbs.append(SafeGradientAccumulation(grad_accum_steps))
+        print(f"Added SafeGradientAccumulation callback with {grad_accum_steps} steps.")
+        
+        # cbs.append(GradientAccumulation(grad_accum_steps))
+        # print(f"Added GradientAccumulation callback with {grad_accum_steps} steps.")
     
     use_mixed_precision = config.get('training', {}).get('use_mixed_precision', False)
-    if use_mixed_precision:
-        cbs.append(MixedPrecision())
-        print("Added MixedPrecision callback.")
+    qlora_enabled = config.get('model', {}).get('quantization', {}).get('load_in_4bit', False)
+    if use_mixed_precision and not qlora_enabled: # Only add if explicitly enabled AND QLoRA is OFF
+        cbs.append(LLaVAMixedPrecision()) # Or your current custom MixedPrecision
+        print("Added MixedPrecision callback (QLoRA is disabled).")
+    elif use_mixed_precision and qlora_enabled:
+        print("QLoRA is enabled, MixedPrecision callback will be skipped as QLoRA handles its own precision.")
+    
+    # if use_mixed_precision:
+    #     cbs.append(LLaVAMixedPrecision())
+    #     print("Added MixedPrecision callback.")
+    
     # --------------------------------------------------------------
     
     # 7. Create Learner
@@ -198,7 +230,8 @@ def get_stage1_learner(config: dict) -> Learner:
             splitter=splitter,
             cbs=cbs,
             path=output_dir, # Set Learner path for saving models
-            train_bn=False # Avoid issues with frozen batch norm layers in LLM/Vision Tower
+            train_bn=False, # Avoid issues with frozen batch norm layers in LLM/Vision Tower
+            # wd=wd
         )
             
     except Exception as e:
@@ -235,7 +268,7 @@ def train_stage1(config_path: str | Path):
         
         # Use fit_one_cycle (common practice)
         # You could also use learner.fit(epochs, lr=lr) or other fine-tuning methods
-        learner.fit_one_cycle(epochs, lr_max=lr)
+        learner.fit(epochs, lr=lr)
         
         print("Training finished.")
         

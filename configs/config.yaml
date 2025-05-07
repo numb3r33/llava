@@ -142,8 +142,8 @@ training:
   warmup_ratio: 0.03 # Ratio of steps for linear warmup
 
   # Optimization
-  gradient_accumulation_steps: 4 # Accumulate gradients over N steps
-  use_mixed_precision: true # Use float16/bfloat16 (if supported)
+  gradient_accumulation_steps: 16 # Accumulate gradients over N steps
+  use_mixed_precision: false # Use float16/bfloat16 (if supported)
 
   # Stage 1 Specifics
   freeze_vision_encoder_stage1: true
