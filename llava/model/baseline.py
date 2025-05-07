@@ -9,6 +9,7 @@ __all__ = ['project_root', 'project_root_str', 'LLaVAProjector', 'BaselineLLaVAM
 import sys
 from pathlib import Path
 import os
+from typing import Any
 
 # Assumes the notebook is run from the project root or one level down (e.g., nbs/)
 # Navigate up to the project root (where settings.ini or .git likely exists)
@@ -29,7 +30,7 @@ else:
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence # For padding variable length sequences
-from transformers import CLIPVisionModel, AutoModelForCausalLM, AutoConfig
+from transformers import CLIPVisionModel, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 from transformers.modeling_outputs import BaseModelOutputWithPooling, CausalLMOutputWithPast # For type hints
 import warnings
 from typing import Optional # Added for type hinting
@@ -113,25 +114,8 @@ class LLaVAProjector(nn.Module):
 
 # %% ../../nbs/20_model_baseline.ipynb 13
 class BaselineLLaVAModel(nn.Module):
-    """Baseline LLaVA 1.5 model combining Vision Encoder, Projector, and LLM.
-
-    Loads the specified Vision Encoder (CLIP) and LLM (Vicuna) from Hugging Face Hub,
-    along with the Projector. Handles freezing components, LLM embedding resizing,
-    and optionally applies LoRA to the LLM based on the configuration.
-    Implements `encode_image`, activation checkpointing, and the main `forward` pass.
-    """
+    """Baseline LLaVA 1.5 model combining Vision Encoder, Projector, and LLM."""
     def __init__(self, config: dict):
-        """Initializes the Baseline LLaVA model structure.
-
-        Loads Vision Encoder, LLM, and Projector based on the config.
-        Resizes LLM embeddings to match the tokenizer vocabulary size.
-        Optionally applies LoRA to the LLM.
-        Optionally applies activation checkpointing to the LLM.
-
-        Args:
-            config: Dictionary containing model configuration, including paths/names
-                    for vision encoder, LLM, projector dimensions, LoRA settings, checkpointing, etc.
-        """
         super().__init__()
         self.config = config 
         self.model_config = config.get('model', {}) 
@@ -146,12 +130,11 @@ class BaselineLLaVAModel(nn.Module):
         self.vision_encoder_name = self.model_config.get('vision_encoder_name_or_path', 'openai/clip-vit-large-patch14-336')
         self.llm_name = self.model_config.get('llm_name_or_path', 'lmsys/vicuna-7b-v1.5')
 
-        llm_hf_config = AutoConfig.from_pretrained(self.llm_name)
-        vision_hf_config = AutoConfig.from_pretrained(self.vision_encoder_name)
+        llm_hf_config = AutoConfig.from_pretrained(self.llm_name, trust_remote_code=True)
+        vision_hf_config = AutoConfig.from_pretrained(self.vision_encoder_name, trust_remote_code=True)
 
         projector_cfg_from_yaml = self.model_config.get('projector', {})
         
-        # Corrected: Access vision_config.hidden_size from CLIPConfig
         proj_input_dim_fallback = vision_hf_config.vision_config.hidden_size if hasattr(vision_hf_config, 'vision_config') else vision_hf_config.hidden_size
         proj_input_dim = projector_cfg_from_yaml.get('input_dim', proj_input_dim_fallback)
         proj_output_dim = projector_cfg_from_yaml.get('output_dim', llm_hf_config.hidden_size)
@@ -160,71 +143,116 @@ class BaselineLLaVAModel(nn.Module):
         self.projector = LLaVAProjector(proj_input_dim, proj_output_dim)
 
         self.load_vision_tower(expected_output_dim=proj_input_dim)
-        self.load_language_model()
+        self.load_language_model() 
         self.resize_llm_embeddings()
         self.apply_activation_checkpointing()
 
+        if torch.cuda.is_available():
+            target_device = torch.device("cuda:0")
+            if self.vision_tower is not None and next(self.vision_tower.parameters()).device != target_device:
+                print(f"Moving vision_tower to {target_device}")
+                self.vision_tower.to(target_device)
+            if self.projector is not None and next(self.projector.parameters()).device != target_device:
+                print(f"Moving projector to {target_device}")
+                self.projector.to(target_device)
+            if self.language_model is not None:
+                 llm_device = next(self.language_model.parameters()).device
+                 print(f"Language model's first parameter is on device: {llm_device}")
+
+
     def load_vision_tower(self, expected_output_dim: int):
-        """Loads the CLIP Vision Model based on the configuration."""
         try:
             print(f"Loading Vision Tower: {self.vision_encoder_name}...")
-            self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_encoder_name)
+            self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_encoder_name, trust_remote_code=True)
             print(f"Vision Tower loaded successfully.")
             self.vision_tower.requires_grad_(False)
             print(f"Vision Tower weights frozen.")
-
-            # For CLIPVisionModel, the relevant config is self.vision_tower.config
             vision_output_dim = self.vision_tower.config.hidden_size
             if vision_output_dim != expected_output_dim:
                 warnings.warn(
                     f"Vision Tower output dimension ({vision_output_dim}) does not match "
-                    f"Projector input dimension ({expected_output_dim}). Check vision model and config['model']['projector']['input_dim']."
+                    f"Projector input dimension ({expected_output_dim})."
                 )
         except Exception as e:
             print(f"Error loading Vision Tower ({self.vision_encoder_name}): {e}")
             self.vision_tower = None
 
     def load_language_model(self):
-        """Loads the Language Model and optionally applies LoRA based on the configuration."""
         try:
             print(f"Loading Language Model: {self.llm_name}...")
-            self.language_model = AutoModelForCausalLM.from_pretrained(self.llm_name)
-            print(f"Language Model loaded successfully.")
-            self.language_model.requires_grad_(False)
-            print(f"Base Language Model weights frozen.")
+            
+            quantization_config_dict = self.model_config.get('quantization', {})
+            load_in_4bit = quantization_config_dict.get('load_in_4bit', False)
+            bnb_config = None
+            extra_kwargs = {"trust_remote_code": True}
 
-            peft_config = self.model_config.get('peft', {})
-            use_lora = peft_config.get('use_lora', False)
+            if load_in_4bit:
+                if BitsAndBytesConfig is None:
+                    raise ImportError("bitsandbytes library is required for 4-bit quantization but not found.")
+                
+                bnb_4bit_quant_type = quantization_config_dict.get('bnb_4bit_quant_type', "nf4")
+                bnb_4bit_compute_dtype_str = quantization_config_dict.get('bnb_4bit_compute_dtype', "float16")
+                compute_dtype = getattr(torch, bnb_4bit_compute_dtype_str)
+
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type=bnb_4bit_quant_type,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=quantization_config_dict.get('bnb_4bit_use_double_quant', False),
+                )
+                print(f"QLoRA enabled: Loading LLM in 4-bit with compute dtype {compute_dtype}.")
+                if torch.cuda.is_available():
+                    extra_kwargs["device_map"] = {"": 0} 
+                    print(f"  Setting device_map to {{'': 0}} for QLoRA.")
+                else:
+                    print("  Warning: CUDA not available, QLoRA device_map will not be set to GPU. Model will load on CPU if possible.")
+                extra_kwargs["quantization_config"] = bnb_config
+            
+            self.language_model = AutoModelForCausalLM.from_pretrained(
+                self.llm_name,
+                **extra_kwargs 
+            )
+            print(f"Language Model loaded successfully.")
+            
+            if not load_in_4bit: 
+                 self.language_model.requires_grad_(False)
+                 print(f"Base Language Model weights frozen (non-QLoRA path).")
+
+            peft_config_dict = self.model_config.get('peft', {}) 
+            use_lora = peft_config_dict.get('use_lora', False)
 
             if use_lora:
                 if not _peft_available:
                     print("Warning: `use_lora` is true in config, but peft library is not installed. Skipping LoRA.")
                 else:
-                    print("Applying LoRA...")
-                    lora_r = peft_config.get('lora_r', 8)
-                    lora_alpha = peft_config.get('lora_alpha', 16)
-                    lora_dropout = peft_config.get('lora_dropout', 0.05)
-                    target_modules = peft_config.get('target_modules', ['q_proj', 'v_proj'])
+                    if isinstance(self.language_model, PeftModel):
+                        print("Language model is already a PeftModel. Ensure LoRA config matches if re-applying.")
                     
-                    lora_config_obj = LoraConfig( # Renamed to avoid conflict
+                    print("Applying LoRA...")
+                    lora_r = peft_config_dict.get('lora_r', 8)
+                    lora_alpha = peft_config_dict.get('lora_alpha', 16)
+                    lora_dropout = peft_config_dict.get('lora_dropout', 0.05)
+                    target_modules = peft_config_dict.get('target_modules', ['q_proj', 'v_proj'])
+                    
+                    current_lora_config = LoraConfig( 
                         r=lora_r,
                         lora_alpha=lora_alpha,
                         target_modules=target_modules,
                         lora_dropout=lora_dropout,
                         bias="none",
                     )
-                    
-                    self.language_model = get_peft_model(self.language_model, lora_config_obj)
+                    self.language_model = get_peft_model(self.language_model, current_lora_config)
                     print(f"LoRA applied. Config: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, modules={target_modules}")
                     self.language_model.print_trainable_parameters()
             else:
                 print("LoRA is disabled in the configuration.")
         except Exception as e:
             print(f"Error loading Language Model ({self.llm_name}): {e}")
+            import traceback
+            traceback.print_exc()
             self.language_model = None
 
     def resize_llm_embeddings(self):
-        """Resizes the LLM's token embeddings to match the tokenizer size."""
         if self.language_model is None or tokenizer is None:
             print("Warning: Cannot resize LLM embeddings. LLM or tokenizer not available.")
             return
@@ -241,7 +269,6 @@ class BaselineLLaVAModel(nn.Module):
             print("LLM embedding size already matches tokenizer size. No resizing needed.")
             
     def apply_activation_checkpointing(self):
-        """Applies gradient checkpointing if enabled in the config."""
         use_checkpointing = self.model_config.get('use_activation_checkpointing', False)
         if use_checkpointing:
             if self.language_model is not None:
@@ -260,19 +287,18 @@ class BaselineLLaVAModel(nn.Module):
              print("Activation checkpointing is disabled in the configuration.")
 
     def get_input_embeddings(self) -> nn.Embedding:
-        """Helper to get the LLM's input embedding layer."""
         if self.language_model is None:
             raise ValueError("Language model not loaded.")
         return self.language_model.get_input_embeddings()
 
     def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor | None:
-        """Encodes images using the vision tower and extracts features from the specified layer."""
         if self.vision_tower is None:
             print("Error: Vision tower not loaded, cannot encode image.")
             return None
         try:
-            device = self.vision_tower.device
-            pixel_values = pixel_values.to(device, dtype=next(self.vision_tower.parameters()).dtype) # Match vision tower dtype
+            vision_device = next(self.vision_tower.parameters()).device
+            vision_dtype = next(self.vision_tower.parameters()).dtype
+            pixel_values = pixel_values.to(vision_device, dtype=vision_dtype)
 
             vision_outputs: BaseModelOutputWithPooling = self.vision_tower(
                 pixel_values,
@@ -287,38 +313,80 @@ class BaselineLLaVAModel(nn.Module):
             traceback.print_exc()
             return None
 
-    def forward(self,
-                pixel_values: torch.Tensor,
-                input_ids: torch.Tensor,
+    def forward(self, 
+                *args: Any, # To catch positional arguments like a single dict from Learner.summary
+                pixel_values: Optional[torch.Tensor] = None,
+                input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None, 
-                labels: Optional[torch.Tensor] = None 
+                labels: Optional[torch.Tensor] = None,
+                **kwargs: Any
                ) -> CausalLMOutputWithPast:
+        
+        # Handle cases where inputs might be packed in a dictionary (e.g., from Learner)
+        # or passed as keyword arguments directly.
+        batch_dict = {}
+        if len(args) == 1 and isinstance(args[0], dict):
+            batch_dict = args[0]
+        elif len(args) > 0: # Attempt to map positional args if not a dict; less robust
+            # This path is less ideal; prefer keyword args or a single dict
+            if pixel_values is None and isinstance(args[0], torch.Tensor): pixel_values = args[0]
+            if input_ids is None and len(args) > 1 and isinstance(args[1], torch.Tensor): input_ids = args[1]
+            if attention_mask is None and len(args) > 2 and (args[2] is None or isinstance(args[2], torch.Tensor)): attention_mask = args[2]
+            if labels is None and len(args) > 3 and (args[3] is None or isinstance(args[3], torch.Tensor)): labels = args[3]
+
+        # Update from kwargs if they were provided
+        if 'pixel_values' in kwargs: pixel_values = kwargs['pixel_values']
+        if 'input_ids' in kwargs: input_ids = kwargs['input_ids']
+        if 'attention_mask' in kwargs: attention_mask = kwargs['attention_mask']
+        if 'labels' in kwargs: labels = kwargs['labels']
+        
+        # If batch_dict was populated, use its values preferentially or if others are None
+        if batch_dict:
+            pixel_values = batch_dict.get('pixel_values', pixel_values)
+            input_ids = batch_dict.get('input_ids', input_ids)
+            attention_mask = batch_dict.get('attention_mask', attention_mask)
+            labels = batch_dict.get('labels', labels)
+
+        if pixel_values is None or input_ids is None:
+            # This error will be caught by the Learner.summary() or training loop if inputs are malformed.
+            raise ValueError("forward() missing required arguments: pixel_values and input_ids must be provided.")
+
         if self.language_model is None or self.vision_tower is None or self.projector is None:
             raise RuntimeError("Model components (LLM, Vision Tower, Projector) are not fully loaded.")
 
         image_features = self.encode_image(pixel_values)
         if image_features is None:
             raise RuntimeError("Image encoding failed.")
+        
+        projector_device = next(self.projector.parameters()).device
+        image_features = image_features.to(projector_device)
         projected_image_features = self.projector(image_features)
         num_image_patches = projected_image_features.shape[1]
-
-        input_ids_clone = input_ids.clone()
+        
+        embedding_layer = self.get_input_embeddings()
+        target_device = embedding_layer.weight.device
+        
+        input_ids_clone = input_ids.clone().to(target_device) 
         input_ids_clone[input_ids_clone == self.image_token_index_marker] = 0 
-        text_embeddings = self.get_input_embeddings()(input_ids_clone)
+        
+        text_embeddings = embedding_layer(input_ids_clone)
+        projected_image_features = projected_image_features.to(target_device, dtype=text_embeddings.dtype)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         new_attention_mask = []
 
         for batch_idx in range(input_ids.shape[0]):
-            image_token_indices = torch.where(input_ids[batch_idx] == self.image_token_index_marker)[0]
+            current_input_ids_slice = input_ids[batch_idx].to(target_device)
+            image_token_indices = torch.where(current_input_ids_slice == self.image_token_index_marker)[0]
+            
             if len(image_token_indices) == 0:
                 warnings.warn(f"Image token placeholder {self.image_token_index_marker} not found in batch index {batch_idx}. Skipping image features.")
                 new_input_embeds.append(text_embeddings[batch_idx])
-                current_attention_mask = attention_mask[batch_idx] if attention_mask is not None else (input_ids[batch_idx] != tokenizer.pad_token_id).long()
-                new_attention_mask.append(current_attention_mask)
+                current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+                new_attention_mask.append(current_attention_mask_slice)
                 if new_labels is not None and labels is not None:
-                    new_labels.append(labels[batch_idx])
+                    new_labels.append(labels[batch_idx].to(target_device))
                 continue
 
             image_token_start_index = image_token_indices[0].item()
@@ -327,22 +395,23 @@ class BaselineLLaVAModel(nn.Module):
 
             cur_new_embed = torch.cat([
                 text_emb_before,
-                projected_image_features[batch_idx].to(text_embeddings.device, dtype=text_embeddings.dtype),
+                projected_image_features[batch_idx], 
                 text_emb_after
             ], dim=0)
             new_input_embeds.append(cur_new_embed)
 
-            current_attention_mask = attention_mask[batch_idx] if attention_mask is not None else (input_ids[batch_idx] != tokenizer.pad_token_id).long()
-            mask_before = current_attention_mask[:image_token_start_index]
-            mask_image = torch.ones(num_image_patches, dtype=torch.long, device=current_attention_mask.device)
-            mask_after = current_attention_mask[image_token_start_index + 1:]
+            current_attention_mask_slice = attention_mask[batch_idx].to(target_device) if attention_mask is not None else (current_input_ids_slice != tokenizer.pad_token_id).long()
+            mask_before = current_attention_mask_slice[:image_token_start_index]
+            mask_image = torch.ones(num_image_patches, dtype=torch.long, device=target_device)
+            mask_after = current_attention_mask_slice[image_token_start_index + 1:]
             cur_new_mask = torch.cat([mask_before, mask_image, mask_after], dim=0)
             new_attention_mask.append(cur_new_mask)
 
             if new_labels is not None and labels is not None:
-                label_before = labels[batch_idx, :image_token_start_index]
-                label_image = torch.full((num_image_patches,), self.ignore_index, dtype=torch.long, device=labels.device)
-                label_after = labels[batch_idx, image_token_start_index + 1:]
+                current_labels_slice = labels[batch_idx].to(target_device)
+                label_before = current_labels_slice[:image_token_start_index]
+                label_image = torch.full((num_image_patches,), self.ignore_index, dtype=torch.long, device=target_device)
+                label_after = current_labels_slice[image_token_start_index + 1:]
                 cur_new_label = torch.cat([label_before, label_image, label_after], dim=0)
                 new_labels.append(cur_new_label)
 
@@ -351,11 +420,11 @@ class BaselineLLaVAModel(nn.Module):
         padded_labels = None
         if new_labels is not None:
             padded_labels = pad_sequence(new_labels, batch_first=True, padding_value=self.ignore_index)
-
+        
         outputs: CausalLMOutputWithPast = self.language_model(
-            inputs_embeds=padded_input_embeds,
-            attention_mask=padded_attention_mask,
-            labels=padded_labels,
+            inputs_embeds=padded_input_embeds, 
+            attention_mask=padded_attention_mask, 
+            labels=padded_labels, 
             return_dict=True
         )
         return outputs

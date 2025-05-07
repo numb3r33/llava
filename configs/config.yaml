@@ -70,6 +70,12 @@ model:
     # Output dim should match LLM hidden dim (e.g., 4096 for Vicuna-7B)
     output_dim: 4096
 
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "float16" # float16 is safer for older GPUs
+    bnb_4bit_use_double_quant: false
+
   # PEFT (LoRA) configuration (for Stage 2) - Step 4.2
   peft:
     use_lora: true          # Enable/disable LoRA for Stage 2 Fine-tuning
@@ -118,9 +124,9 @@ data:
   stage2_text_template: v1 # Vicuna v1 chat template
 
   # Dataloader parameters
-  batch_size_per_device_stage1: 8 # Adjust based on VRAM
+  batch_size_per_device_stage1: 2 # Adjust based on VRAM
   batch_size_per_device_stage2: 4 # Adjust based on VRAM
-  num_workers: 4
+  num_workers: 16
 
 # --- Training Parameters ---
 training:
@@ -152,7 +158,7 @@ training:
 
 # --- Evaluation Parameters ---
 evaluation:
-  eval_batch_size_per_device: 4 # Batch size for evaluation runs
+  eval_batch_size_per_device: 2 # Batch size for evaluation runs
   # Add specific benchmark evaluation settings if needed
   generation_max_length: 200 # Max tokens for generate_predictions
   generation_temperature: 0.2
@@ -163,7 +169,7 @@ logging:
   wandb:
     enabled: false # Disable W&B by default for local testing, enable for actual runs
     project: llava-adaptive-patching-fastai # TODO: Update W&B project name
-    entity: # TODO: Update W&B entity (username or team) - Leave blank or null to use default entity
+    entity: numb3r33 # TODO: Update W&B entity (username or team) - Leave blank or null to use default entity
     log_model: false # Whether to log model checkpoints as W&B artifacts ("checkpoint" or false)
     run_name_prefix: llava # Prefix for generated run names
     # Add run tags/notes templates if desired

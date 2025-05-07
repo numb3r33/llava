@@ -30,13 +30,12 @@ else:
 # %% ../../nbs/31_training_stage1.ipynb 4
 import torch
 from fastai.learner import Learner
-from fastai.optimizer import AdamW
+from fastai.vision.all import * # For splitter
+
 from fastai.callback.wandb import WandbCallback
 from fastai.callback.schedule import fit_one_cycle
-from fastai.callback.save import SaveModelCallback
 from fastai.callback.training import GradientAccumulation # Import GradientAccumulation
 from fastai.callback.fp16 import MixedPrecision # Import MixedPrecision
-from fastai.vision.all import params # For splitter
 from fastai.data.core import DataLoaders
 from functools import partial
 import wandb # Import wandb directly for cleanup
@@ -136,7 +135,7 @@ def get_stage1_learner(config: dict) -> Learner:
     # AdamW is generally preferred for transformer models
     lr = config.get('training', {}).get('learning_rate_stage1', 1e-4)
     wd = config.get('training', {}).get('weight_decay', 0.0)
-    opt_func = partial(AdamW, lr=lr, wd=wd, eps=1e-8) # Added eps for numerical stability
+    opt_func = partial(Adam, lr=lr, wd=wd, eps=1e-8) # Added eps for numerical stability
     print(f"Optimizer: AdamW (lr={lr}, wd={wd})")
 
     # 5. Define Splitter

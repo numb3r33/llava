@@ -6,6 +6,7 @@ datasets
 huggingface-hub
 accelerate
 peft
+bitsandbytes
 sentencepiece   # Often required by Hugging Face tokenizers
 
 # Project Management & Experiment Tracking
